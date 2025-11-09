@@ -10,16 +10,25 @@ import matplotlib.pyplot as plt
 def load_model():
     return YOLO("yolov8n.pt")
 
-def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4"):
+def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4", progress_placeholder=None):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     prev_gray, motion_scores, car_center_y, boxes_list = None, [], [], []
 
+    progress = 0
+    progress_bar = None
+    if progress_placeholder:
+        progress_bar = progress_placeholder.progress(0)
+
+    # --- Pass 1: analyze video frame-by-frame ---
+    frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -48,8 +57,15 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
             car_center_y.append(np.nan)
             boxes_list.append(None)
 
+        # Update progress bar
+        frame_count += 1
+        if progress_bar and total_frames > 0:
+            progress = int((frame_count / total_frames) * 100)
+            progress_bar.progress(min(progress, 100))
+
     cap.release()
 
+    # --- Signal processing ---
     motion_scores = np.array(motion_scores)
     car_center_y = np.array(car_center_y)
     fps = max(fps, 1)
@@ -69,7 +85,6 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
         if np.all(motion_smooth[i-window:i] < stop_threshold):
             stop_idx = i
             break
-
     for i in range(stop_idx + window, total_frames - window):
         if np.all(motion_smooth[i-window:i] > depart_threshold):
             depart_idx = i
@@ -85,6 +100,7 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     car_down_time = min(down_idx / fps, video_duration)
     depart_time = min(depart_idx / fps, video_duration)
 
+    # Sanity adjustments
     if car_up_time < stop_time or (car_up_time - stop_time) > 10:
         car_up_time = stop_time + 2
     if car_down_time < car_up_time or (car_down_time - car_up_time) > 60:
@@ -92,19 +108,9 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     if depart_time < car_down_time or (depart_time - car_down_time) > 10:
         depart_time = car_down_time + 5
 
-    stop_time = max(0, min(stop_time, video_duration))
-    car_up_time = max(0, min(car_up_time, video_duration))
-    car_down_time = max(0, min(car_down_time, video_duration))
-    depart_time = max(0, min(depart_time, video_duration))
-
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
-    events = {
-        "Car Stop": int(stop_idx),
-        "Car Up": int(up_idx),
-        "Car Down": int(down_idx),
-        "Car Depart": int(depart_idx)
-    }
+    events = {"Car Stop": int(stop_idx), "Car Up": int(up_idx), "Car Down": int(down_idx), "Car Depart": int(depart_idx)}
 
     while True:
         ret, frame = cap.read()
@@ -122,6 +128,10 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
 
     cap.release()
     out.release()
+
+    # Finalize progress bar
+    if progress_bar:
+        progress_bar.progress(100)
 
     plt.figure(figsize=(8,3))
     plt.plot(times, motion_smooth, label="Motion Intensity")
@@ -148,24 +158,15 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     }
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Pit Stop Analyzer v5", layout="centered")
-st.title("🏎️ IMSA Pit Stop Analyzer")
-st.markdown(
-    """
-    Upload a pit-stop video to automatically detect:
-    - 🟠 **Car Stop**
-    - 🟢 **Car Up (on air jacks)**
-    - 🔴 **Car Down**
-    - 🔵 **Car Depart**
-    """
-)
-
+st.set_page_config(page_title="Pit Stop Analyzer v7", layout="centered")
+st.title("🏎️ IMSA Pit Stop Analyzer v7")
 st.markdown("""
-<style>
-    .stMetric label {font-size: 1.1rem !important;}
-    .stMetric {background-color: #f9f9f9; border-radius: 10px; padding: 10px;}
-</style>
-""", unsafe_allow_html=True)
+Upload a pit-stop video to automatically detect:
+- 🟠 **Car Stop**
+- 🟢 **Car Up (on air jacks)**
+- 🔴 **Car Down**
+- 🔵 **Car Depart**
+""")
 
 uploaded = st.file_uploader("🎥 Upload your pit-stop video", type=["mp4", "mov", "avi"])
 
@@ -174,21 +175,25 @@ if uploaded:
         tmp.write(uploaded.read())
         tmp_path = tmp.name
 
-    st.video(tmp_path)
-    st.info("⏱️ Analyzing… please wait ⏳")
+    status_placeholder = st.empty()
+    video_placeholder = st.empty()
+    progress_placeholder = st.empty()
+
+    status_placeholder.info("⏱️ **Analyzing… please wait ⏳**")
+    video_placeholder.video(tmp_path)
 
     output_path = os.path.join(tempfile.gettempdir(), "annotated_pitstop.mp4")
-    results = analyze_and_visualize_pitstop(tmp_path, output_path=output_path)
+    results = analyze_and_visualize_pitstop(tmp_path, output_path=output_path, progress_placeholder=progress_placeholder)
 
-    st.success("✅ Analysis Complete!")
+    status_placeholder.success("✅ **Analysis Complete!**")
+
     st.subheader("📊 Pit Stop Summary")
-
     col1, col2, col3 = st.columns(3)
     col1.metric("Car Stop", f"{results['Car Stop Time (s)']} s")
     col1.metric("Car Up", f"{results['Car Up Time (s)']} s")
     col2.metric("Car Down", f"{results['Car Down Time (s)']} s")
     col2.metric("Car Depart", f"{results['Car Depart Time (s)']} s")
-    col3.metric("Pit Duration", f"{results['Pit Duration (s)']} s")    
+    col3.metric("Pit Duration", f"{results['Pit Duration (s)']} s")
 
     st.divider()
     st.subheader("🎬 Annotated Video")
