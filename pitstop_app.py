@@ -276,7 +276,7 @@ def analyze_video(video_path, video_name, output_path,
         "Car Down Time (s)": round(down_idx / fps, 2),
         "Car Depart Time (s)": round(depart_i / fps, 2),
         "Pit Duration (s)": round((depart_i - stop_i) / fps, 2),
-        "Annotated Video": output_path,
+        "Annotated Video": debug_path,
         "Debug Video": debug_path,
         "Pit Direction": direction,
     }
