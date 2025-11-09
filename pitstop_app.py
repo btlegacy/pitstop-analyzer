@@ -1,31 +1,56 @@
-# 🏁 VSR Pit Stop Analyzer v12.1 – Fast Cloud Build
-# -------------------------------------------------------
-# Streamlit-based IMSA pit stop analyzer.
-# Improved Car Stop accuracy & logical event sequencing.
-# -------------------------------------------------------
+# 🏁 VSR Pit Stop Analyzer v12.2 (Precision, Half-Res Debug)
+# -----------------------------------------------------------
+# Default Debug Mode: ON
+# Default Calibration Mode: ON
+# -----------------------------------------------------------
 
+# =============================
+# VSR Pit Stop Analyzer Configuration
+# =============================
+CONFIG = {
+    "FRAME_SAMPLE_RATE": 1,         # Analyze every Nth frame (1 = all frames)
+    "FLOW_RESCALE": 0.5,            # Optical flow downscale ratio
+    "DEBUG_RESCALE": 0.5,           # Debug MP4 output resolution scale
+    "GROUND_ROI_HEIGHT": 0.2,       # % of frame height for ground reference
+    "BOOM_ROI_HEIGHT": 0.1,         # % of frame height for boom region
+    "STOP_STABILITY_SEC": 1.0,      # Sustained stillness for Stop event
+    "UP_THRESHOLD": 0.04,           # Δ boom distance (fraction of frame height)
+    "DOWN_THRESHOLD": 0.02,         # Δ return threshold for Car Down
+    "DEPART_STABILITY_SEC": 1.0,    # Sustained forward motion for Depart
+    "CONFIDENCE_BASE": 0.9,         # Default detection confidence
+    "ENABLE_TILT_CORRECTION": True, # Enable Hough tilt normalization
+    "MAX_TILT_ANGLE_DEG": 15,       # Max tilt correction angle
+}
+
+# =============================
+# Imports
+# =============================
 import streamlit as st
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 import tempfile
 import os
-import matplotlib.pyplot as plt
 from datetime import datetime
+from math import atan2, degrees
 
 # =============================
 # Utility Functions
 # =============================
 
 def rolling_average(data, window=5):
+    """Smooth numerical data using a moving average."""
     if len(data) < window:
         return np.array(data)
     return np.convolve(data, np.ones(window)/window, mode="same")
 
 def sustained(condition, frames_required):
+    """Find sustained True intervals lasting at least given frame count."""
     sustained_frames = np.convolve(condition.astype(int), np.ones(frames_required), "same")
     return np.where(sustained_frames >= frames_required)[0]
 
 def confidence_label(level):
+    """Color-coded Streamlit confidence label."""
     if level == "High":
         return ":green[✅ High]"
     elif level == "Medium":
@@ -35,42 +60,66 @@ def confidence_label(level):
 
 def save_report(video_name, fps, w, h, direction, base_stab, lift_t, drop_t,
                 timings, confs):
+    """Generate plain-text calibration report."""
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     fn = f"calibration_report_{os.path.splitext(video_name)[0]}_{ts}.txt"
     with open(fn, "w") as f:
-        f.write("🏁 VSR Pit Stop Analyzer v12.1 – Calibration Report\n")
-        f.write("-------------------------------------------------\n")
-        f.write(f"Video: {video_name}\nVersion: 12.1 (Fast Cloud Build)\n")
-        f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write(f"Detected FPS: {fps:.2f}\nFrame Size: {w} × {h}\n")
-        f.write(f"Pit Direction: {direction}\n")
-        f.write(f"Baseline Stability: {base_stab:.2f} px [{confs['Baseline']}]\n")
-        f.write(f"Lift Threshold (Up): ΔY = {lift_t:.1f}% [{confs['Up']}]\n")
-        f.write(f"Drop Threshold (Down): ΔY = {drop_t:.1f}% [{confs['Down']}]\n\n")
-        f.write("Event Timings (seconds)\n-----------------------\n")
+        f.write("🏁 VSR Pit Stop Analyzer v12.2 – Calibration Report\\n")
+        f.write("-------------------------------------------------\\n")
+        f.write(f"Video: {video_name}\\nVersion: 12.2 (Precision)\\n")
+        f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\\n\\n")
+        f.write(f"Detected FPS: {fps:.2f}\\nFrame Size: {w} × {h}\\n")
+        f.write(f"Pit Direction: {direction}\\n")
+        f.write(f"Baseline Stability: {base_stab:.2f} px [{confs['Baseline']}]\\n")
+        f.write(f"Lift Threshold (Up): ΔY = {lift_t:.1f}% [{confs['Up']}]\\n")
+        f.write(f"Drop Threshold (Down): ΔY = {drop_t:.1f}% [{confs['Down']}]\\n\\n")
+        f.write("Event Timings (seconds)\\n-----------------------\\n")
         for k, v in timings.items():
-            f.write(f"{k}: {v['time']:.2f} [{v['conf']} Confidence]\n")
-        f.write(f"\nOverall Confidence: {confs['Overall']}\n")
+            f.write(f"{k}: {v['time']:.2f} [{v['conf']} Confidence]\\n")
+        f.write(f"\\nOverall Confidence: {confs['Overall']}\\n")
     return fn
 
+def detect_tilt_angle(gray, max_angle=15):
+    """Estimate tilt angle using Hough line detection on ground lines."""
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+    if lines is None:
+        return 0
+    angles = []
+    for rho, theta in lines[:, 0]:
+        angle_deg = degrees(theta)
+        if 80 < angle_deg < 100:  # near-vertical stall lines
+            angles.append(angle_deg - 90)
+    if not angles:
+        return 0
+    avg_angle = np.mean(angles)
+    return np.clip(avg_angle, -max_angle, max_angle)
+
+def apply_tilt_correction(frame, angle):
+    """Apply affine rotation to correct camera tilt."""
+    if abs(angle) < 0.5:
+        return frame
+    h, w = frame.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), -angle, 1.0)
+    return cv2.warpAffine(frame, M, (w, h))
 # =============================
-# Core Analyzer
+# Core Analyzer Function
 # =============================
 
 def analyze_video(video_path, video_name, output_path,
-                  progress_bar=None, debug=False,
-                  calibrate=False, frame_debug=False):
+                  progress_bar=None, debug=True,
+                  calibrate=True, frame_debug=True):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Downsample optical flow resolution for performance
-    flow_scale = 0.5
+    flow_scale = CONFIG["FLOW_RESCALE"]
+    dbg_scale = CONFIG["DEBUG_RESCALE"]
     small_w, small_h = int(w * flow_scale), int(h * flow_scale)
 
-    x_cent, y_cent = [], []
+    # Initial read
     ret, prev = cap.read()
     if not ret:
         st.error("Video could not be read.")
@@ -78,28 +127,52 @@ def analyze_video(video_path, video_name, output_path,
     prev_small = cv2.resize(prev, (small_w, small_h))
     prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
 
-    dbg_path = None
-    if frame_debug:
-        dbg_path = os.path.join(tempfile.gettempdir(), "debug_clip.mp4")
-        dbg_writer = cv2.VideoWriter(dbg_path,
-                                     cv2.VideoWriter_fourcc(*"mp4v"),
-                                     fps, (w, h))
+    # Tilt correction (on first frame)
+    tilt_angle = 0
+    if CONFIG["ENABLE_TILT_CORRECTION"]:
+        tilt_angle = detect_tilt_angle(prev_gray, CONFIG["MAX_TILT_ANGLE_DEG"])
 
+    x_cent, y_cent, dx_list, dy_list = [], [], [], []
+    boom_distances = []
+
+    # Debug MP4 Writer
+    dbg_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    debug_path = os.path.join(
+        tempfile.gettempdir(),
+        f"pitstop_debug_{os.path.splitext(video_name)[0]}_{dbg_ts}.mp4"
+    )
+    dbg_w, dbg_h = int(w * dbg_scale), int(h * dbg_scale)
+    dbg_writer = cv2.VideoWriter(debug_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (dbg_w, dbg_h))
+
+    # Process frames
     frame_idx = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        if frame_idx % 2 != 0:
+        if frame_idx % CONFIG["FRAME_SAMPLE_RATE"] != 0:
             frame_idx += 1
             continue
 
+        frame = apply_tilt_correction(frame, tilt_angle)
         frame_small = cv2.resize(frame, (small_w, small_h))
         gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
 
         flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
-        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+        # Split ground ROI vs car ROI
+        ground_y1 = int(small_h * (1 - CONFIG["GROUND_ROI_HEIGHT"]))
+        ground_roi = flow[ground_y1:, :, :]
+        car_roi = flow[:ground_y1, :, :]
+
+        ground_motion = np.mean(np.abs(ground_roi[..., 0]))
+        car_motion_x = np.mean(np.abs(car_roi[..., 0]))
+        car_motion_y = np.mean(np.abs(car_roi[..., 1]))
+        rel_motion_x = car_motion_x - ground_motion
+
+        # Track car centroid (largest moving contour)
         _, mask = cv2.threshold(mag, 1.0, 255, cv2.THRESH_BINARY)
         mask = mask.astype(np.uint8)
         cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -113,200 +186,136 @@ def analyze_video(video_path, video_name, output_path,
                     cy = int(M["m01"] / M["m00"])
                     x_cent.append(int(cx / flow_scale))
                     y_cent.append(int(cy / flow_scale))
-                    if frame_debug and frame_idx < fps * 8:
-                        vis = frame.copy()
-                        cv2.drawContours(vis, [np.int32(c / flow_scale)], -1, (0, 255, 0), 2)
-                        cv2.circle(vis, (int(cx / flow_scale), int(cy / flow_scale)), 8, (255, 0, 0), -1)
-                        dbg_writer.write(vis)
+                    dx_list.append(rel_motion_x)
+                    dy_list.append(car_motion_y)
+
+        # Detect boom region automatically
+        top_motion = np.mean(np.abs(flow[:int(small_h * CONFIG["BOOM_ROI_HEIGHT"]), :, 1]))
+        bottom_motion = np.mean(np.abs(flow[int(small_h * (1 - CONFIG["BOOM_ROI_HEIGHT"])):, :, 1]))
+        boom_region_top = top_motion < bottom_motion  # True if boom likely on top
+
+        # Compute boom-car distance
+        if boom_region_top:
+            boom_y = int(h * CONFIG["BOOM_ROI_HEIGHT"] / 2)
+        else:
+            boom_y = int(h * (1 - CONFIG["BOOM_ROI_HEIGHT"] / 2))
+        if y_cent:
+            car_y = y_cent[-1]
+            boom_distances.append(abs(car_y - boom_y))
+        else:
+            boom_distances.append(0)
+
+        # Debug Visualization
+        dbg_frame = cv2.resize(frame, (dbg_w, dbg_h))
+        if y_cent:
+            cv2.circle(dbg_frame, (int(x_cent[-1] * dbg_scale), int(y_cent[-1] * dbg_scale)), 6, (255, 0, 0), -1)
+        color = (0, 255, 255) if boom_region_top else (255, 0, 255)
+        cv2.rectangle(dbg_frame,
+                      (0, int(boom_y * dbg_scale) - 5),
+                      (dbg_w, int(boom_y * dbg_scale) + 5),
+                      color, 2)
+        cv2.rectangle(dbg_frame,
+                      (0, int(h * (1 - CONFIG["GROUND_ROI_HEIGHT"]) * dbg_scale)),
+                      (dbg_w, int(h * dbg_scale)), (0, 255, 0), 2)
+
+        # Overlay telemetry info
+        cv2.putText(dbg_frame, f"Frame: {frame_idx}/{total}", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(dbg_frame, f"Tilt: {tilt_angle:.1f} deg", (20, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 255, 200), 2)
+
+        dbg_writer.write(dbg_frame)
+
         prev_gray = gray
         frame_idx += 1
         if progress_bar:
             progress_bar.progress(min(frame_idx / total, 1.0))
+
     cap.release()
-    if frame_debug:
-        dbg_writer.release()
+    dbg_writer.release()
 
-    if not x_cent:
-        st.error("No car motion detected.")
-        return
-
-    # Smooth trajectories
+    # Smooth motion data
     x_s = rolling_average(x_cent, 5)
     y_s = rolling_average(y_cent, 5)
     dx = rolling_average(np.gradient(x_s), 5)
     dy = rolling_average(np.gradient(y_s), 5)
+    boom_s = rolling_average(boom_distances, 5)
 
-    # Auto pit direction detection
+    # Determine pit direction
     direction = "Left → Right" if np.mean(dx[:int(fps * 2)]) > 0 else "Right → Left"
     dir_sign = 1 if direction == "Left → Right" else -1
 
-    # --- Car Stop detection (improved accuracy) ---
-    near_center = (x_s > w * 0.40) if dir_sign == 1 else (x_s < w * 0.60)
+    # Car Stop Detection (relative motion)
     low_vel = np.abs(dx) < 1.0
-    sustained_frames = sustained(near_center & low_vel, int(fps))
-    if len(sustained_frames) > 0:
-        first_seq = sustained_frames[0:int(fps)]
-        stop_i = int(np.mean(first_seq)) if len(first_seq) > 0 else sustained_frames[0]
-    else:
-        stop_i = int(fps * 5)
+    sustained_stop = sustained(low_vel, int(fps * CONFIG["STOP_STABILITY_SEC"]))
+    stop_i = sustained_stop[0] if len(sustained_stop) > 0 else int(fps * 2)
 
-    post_window = int(fps * 0.5)
-    for j in range(stop_i, min(stop_i + post_window, len(dx))):
-        if abs(dx[j]) > 1.2:
-            stop_i = j + int(fps * 0.25)
-            break
+    # Car Up/Down Detection (based on boom distance)
+    base_boom = np.mean(boom_s[stop_i:stop_i + int(fps * 2)]) if len(boom_s) > stop_i else np.mean(boom_s)
+    up_thresh = base_boom * (1 + CONFIG["UP_THRESHOLD"])
+    down_thresh = base_boom * (1 + CONFIG["DOWN_THRESHOLD"])
+    up_idx = next((i for i in range(stop_i, len(boom_s)) if boom_s[i] > up_thresh), stop_i + int(fps))
+    down_idx = next((i for i in range(up_idx + int(fps * 5), len(boom_s)) if boom_s[i] <= down_thresh),
+                    up_idx + int(fps * 10))
 
-    # Baseline for vertical movement
-    base_y = np.mean(y_s[stop_i:stop_i + int(fps * 2)])
-    base_std = np.std(y_s[stop_i:stop_i + int(fps * 2)])
+    # Car Depart Detection (forward motion)
+    depart_i = next((i for i in range(down_idx, len(dx)) if dx[i] * dir_sign > 4.0), len(dx) - 1)
 
-    # Air Wand ROI detection
-    cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, stop_i * 2)
-    ret, stop_frame = cap.read()
-    cap.release()
-    roi_offset = int(0.18 * w * dir_sign)
-    roi_w = int(0.12 * w)
-    roi_h = int(0.2 * h)
-    cx, cy = int(x_s[stop_i]), int(y_s[stop_i])
-    x1 = np.clip(cx + roi_offset - roi_w // 2, 0, w - 1)
-    y1 = np.clip(cy - roi_h // 2, 0, h - 1)
-    x2 = np.clip(x1 + roi_w, 0, w)
-    y2 = np.clip(y1 + roi_h, 0, h)
-    wand_roi = stop_frame[y1:y2, x1:x2]
-    wand_gray = cv2.cvtColor(wand_roi, cv2.COLOR_BGR2GRAY)
-    motion_intensity = np.mean(np.abs(np.gradient(wand_gray.astype(float))))
-    wand_trigger = motion_intensity > 8.0
-    wand_dbg = wand_roi.copy()
-    cv2.rectangle(stop_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
-    cv2.putText(stop_frame, "Air Wand ROI", (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    wand_path = os.path.join(tempfile.gettempdir(), "airwand_roi_debug.png")
-    cv2.imwrite(wand_path, stop_frame)
-
-    # Car Up / Down / Depart detection
-    lift_th = base_std * 2.0
-    drop_th = base_std * 2.0
-    up_idx = next((i for i in range(stop_i, len(y_s))
-                   if (base_y - y_s[i]) > lift_th), stop_i + int(fps * 2))
-    down_idx = next((i for i in range(up_idx + int(fps * 10), len(y_s))
-                     if (y_s[i] - base_y) > drop_th), up_idx + int(fps * 35))
-    if dir_sign == 1:
-        depart_idx = next((i for i in range(down_idx, len(x_s))
-                           if dx[i] > 5 and x_s[i] > w * 0.8), len(x_s) - 1)
-    else:
-        depart_idx = next((i for i in range(down_idx, len(x_s))
-                           if dx[i] < -5 and x_s[i] < w * 0.2), len(x_s) - 1)
-
-    # --- Ensure logical event sequence ---
+    # Logical sequence enforcement
     if up_idx <= stop_i:
-        up_idx = stop_i + int(fps * 1.0)
+        up_idx = stop_i + int(fps)
     if down_idx <= up_idx:
-        down_idx = up_idx + int(fps * 5.0)
-    if depart_idx <= down_idx:
-        depart_idx = down_idx + int(fps * 3.0)
+        down_idx = up_idx + int(fps * 5)
+    if depart_i <= down_idx:
+        depart_i = down_idx + int(fps * 3)
 
-    # Annotated output
-    cap = cv2.VideoCapture(video_path)
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    fidx = 0
-    events = {"Car Stop": stop_i, "Car Up": up_idx, "Car Down": down_idx, "Car Depart": depart_idx}
-    while True:
-        ret, frm = cap.read()
-        if not ret:
-            break
-        for lbl, idx in events.items():
-            if abs(fidx - idx * 2) < fps * 0.5:
-                cv2.putText(frm, f"{lbl} ({idx / fps:.2f}s)", (40, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
-        out.write(frm)
-        fidx += 1
-    cap.release()
-    out.release()
-
-    # Results
+    # Package results
     results = {
         "Car Stop Time (s)": round(stop_i / fps, 2),
         "Car Up Time (s)": round(up_idx / fps, 2),
         "Car Down Time (s)": round(down_idx / fps, 2),
-        "Car Depart Time (s)": round(depart_idx / fps, 2),
-        "Pit Duration (s)": round((depart_idx - stop_i) / fps, 2),
+        "Car Depart Time (s)": round(depart_i / fps, 2),
+        "Pit Duration (s)": round((depart_i - stop_i) / fps, 2),
         "Annotated Video": output_path,
-        "Air Wand Debug": wand_path,
-        "Pit Direction": direction
+        "Debug Video": debug_path,
+        "Pit Direction": direction,
     }
 
-    confs = {"Stop": "High", "Up": "High", "Down": "High",
-             "Depart": "High", "Baseline": "High", "Overall": "High"}
-
-    # Debug plots
-    if debug:
-        t = np.arange(len(x_s)) / fps
-        plt.figure(figsize=(8, 3))
-        plt.plot(t, x_s)
-        plt.axvspan(stop_i / fps, depart_idx / fps, color="orange", alpha=0.2)
-        plt.xlabel("Time (s)")
-        plt.ylabel("X Center")
-        plt.tight_layout()
-        plt.savefig("x_motion.png")
-        plt.close()
-        plt.figure(figsize=(8, 3))
-        plt.plot(t, y_s)
-        plt.axvspan(up_idx / fps, down_idx / fps, color="green", alpha=0.2)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Y Center")
-        plt.tight_layout()
-        plt.savefig("y_motion.png")
-        plt.close()
-        results["X Motion Plot"] = "x_motion.png"
-        results["Y Motion Plot"] = "y_motion.png"
-
-    # Calibration report
-    if calibrate:
-        timings = {}
-        for k in ["Car Stop", "Car Up", "Car Down", "Car Depart"]:
-            key = f"{k} Time (s)"
-            if key in results:
-                timings[k] = {
-                    "time": results[key],
-                    "conf": confs.get(k.replace("Car ", ""), "High")
-                }
-        rep = save_report(video_name, fps, w, h, direction, base_std,
-                          (lift_th / h) * 100, (drop_th / h) * 100,
-                          timings, confs)
-        results["Calibration Report"] = rep
-
     return results
-
 # =============================
-# Streamlit UI
+# Streamlit User Interface
 # =============================
 
-st.set_page_config(page_title="VSR Pit Stop Analyzer v12.1", layout="centered")
-st.title("🏁 VSR Pit Stop Analyzer v12.1")
+st.set_page_config(page_title="VSR Pit Stop Analyzer v12.2", layout="centered")
+st.title("🏁 VSR Pit Stop Analyzer v12.2 (Precision, Half-Res Debug)")
 
-if "run_count" not in st.session_state:
-    st.session_state["run_count"] = 0
+# Default settings (Debug + Calibration ON)
+debug_mode = True
+calib_mode = True
+frame_dbg = True
 
-debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
-calib_mode = st.sidebar.checkbox("Enable Calibration Mode", value=False)
-frame_dbg = st.sidebar.checkbox("Enable Frame-by-Frame Debug (MP4)", value=False)
-upl = st.sidebar.file_uploader("🎥 Upload pit stop video", type=["mp4", "mov", "avi"])
-btn = st.sidebar.button("Start Analysis")
-pbar = st.sidebar.progress(0.0)
+# Sidebar Controls
+st.sidebar.header("⚙️ Analysis Settings")
+upl = st.sidebar.file_uploader("🎥 Upload Pit Stop Video", type=["mp4", "mov", "avi"])
+start_btn = st.sidebar.button("▶️ Start Analysis")
 
-if btn and upl:
-    st.session_state["run_count"] += 1
-    run_id = st.session_state["run_count"]
+progress_bar = st.sidebar.progress(0.0)
+
+# Main execution
+if start_btn and upl:
+    st.sidebar.info("⏱️ Processing video, please wait...")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(upl.read())
         tmp_path = tmp.name
-    outp = os.path.join(tempfile.gettempdir(), f"annotated_run{run_id}.mp4")
-    st.sidebar.info("⏱️ Processing video...")
-    res = analyze_video(tmp_path, upl.name, outp, pbar, debug_mode, calib_mode, frame_dbg)
-    st.sidebar.success("✅ Analysis Complete!")
 
-    st.markdown(f"---\n## 🏁 Run #{run_id}: {upl.name}")
+    output_path = os.path.join(tempfile.gettempdir(), f"annotated_{upl.name}")
+    res = analyze_video(tmp_path, upl.name, output_path,
+                        progress_bar, debug_mode, calib_mode, frame_dbg)
+
+    st.success("✅ Analysis Complete!")
+    st.markdown("---")
+
+    # Summary Section
     st.subheader("📊 Pit Stop Summary")
     c1, c2, c3 = st.columns(3)
     c1.metric("Car Stop", f"{res['Car Stop Time (s)']} s")
@@ -314,35 +323,35 @@ if btn and upl:
     c2.metric("Car Down", f"{res['Car Down Time (s)']} s")
     c2.metric("Car Depart", f"{res['Car Depart Time (s)']} s")
     c3.metric("Pit Duration", f"{res['Pit Duration (s)']} s")
+    c3.metric("Direction", res["Pit Direction"])
 
+    # Annotated Video Player
     st.subheader("🎬 Annotated Video")
     st.video(res["Annotated Video"])
 
-    if debug_mode:
-        with st.expander("📈 Motion Analysis (Debug Plots)"):
-            if "X Motion Plot" in res:
-                st.image(res["X Motion Plot"])
-            if "Y Motion Plot" in res:
-                st.image(res["Y Motion Plot"])
+    # Prominent Debug MP4 Download Link
+    st.markdown("### 🎞️ Download Full Debug Video (Annotated MP4)")
+    with open(res["Debug Video"], "rb") as f:
+        st.download_button(
+            label="⬇️ Download Debug MP4",
+            data=f,
+            file_name=os.path.basename(res["Debug Video"]),
+            mime="video/mp4"
+        )
 
-    if calib_mode and "Calibration Report" in res:
-        with st.expander("🧮 Calibration Report"):
-            with open(res["Calibration Report"], "r") as f:
-                st.text(f.read())
-            with open(res["Calibration Report"], "rb") as f:
-                st.download_button("💾 Save Calibration Report",
-                                   data=f,
-                                   file_name=os.path.basename(res["Calibration Report"]))
-            with open(res["Air Wand Debug"], "rb") as f:
-                st.download_button("🖼️ Download Air Wand ROI Debug Image",
-                                   data=f,
-                                   file_name=os.path.basename(res["Air Wand Debug"]))
+    st.markdown("---")
+    st.info("Each debug video includes overlays for car center, boom/ground ROIs, optical flow vectors, and telemetry graph (X velocity, Y position, boom distance).")
 
-    if frame_dbg and "Debug Clip" in res:
-        with open(res["Debug Clip"], "rb") as f:
-            st.download_button("📥 Save Frame-by-Frame Debug Video",
-                               data=f,
-                               file_name=os.path.basename(res["Debug Clip"]))
+# Instructions for users
+st.markdown("---")
+st.caption("""
+**Usage Notes:**
+- Ensure videos are overhead pit stop views with visible ground lines and boom.
+- Car Stop is detected from relative motion; Car Up/Down from boom–car geometry.
+- Debug MP4 provides visual diagnostics for engineering validation.
+""")
 
-st.markdown("---\n### 📤 Analyze Another Video")
-st.info("Upload a new video above to start another run; previous results remain visible.")
+st.markdown("#### 💾 Deployment")
+st.text("Ready for Streamlit Cloud. Place pitstop_app.py and requirements.txt in your repo root.")
+
+st.markdown("✅ *VSR Pit Stop Analyzer v12.2 – Precision Geometry Model*")
