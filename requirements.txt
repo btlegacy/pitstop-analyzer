@@ -1,5 +1,5 @@
 streamlit==1.38.0
 ultralytics==8.2.88
-opencv-python-headless==4.9.0.80
+opencv-contrib-python-headless==4.9.0.80
 numpy==1.26.4
 matplotlib==3.8.2
