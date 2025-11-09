@@ -1,286 +1,250 @@
-# 🏁 VSR Pit Stop Analyzer v10 – Fixed-Camera, Multi-Run, Calibration Mode
-# Streamlit-based app for analyzing pit stop events (Stop, Up, Down, Depart)
-# using motion-only sustained detection logic for overhead fixed-camera videos.
+# 🏁 VSR Pit Stop Analyzer v11
+# Fixed-Camera, Adaptive Color + Optical-Flow Motion Analysis
+# Streamlit application for analyzing pit-stop phases.
 
 import streamlit as st
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import tempfile
 import os
 import matplotlib.pyplot as plt
 from datetime import datetime
+from sklearn.cluster import KMeans
 
 # =============================
 # Utility Functions
 # =============================
 
-@st.cache_resource
-def load_model():
-    return YOLO("yolov8n.pt")
-
 def rolling_average(data, window=5):
-    return np.convolve(data, np.ones(window)/window, mode='same')
+    if len(data) < window:
+        return np.array(data)
+    return np.convolve(data, np.ones(window)/window, mode="same")
 
 def sustained(condition, frames_required):
-    sustained_frames = np.convolve(condition.astype(int), np.ones(frames_required), 'same')
+    sustained_frames = np.convolve(condition.astype(int), np.ones(frames_required), "same")
     return np.where(sustained_frames >= frames_required)[0]
 
-def confidence_label(conf):
-    if conf == "High":
-        return f":green[✅ {conf}]"
-    elif conf == "Medium":
-        return f":orange[⚠️ {conf}]"
+def confidence_label(level):
+    if level == "High":
+        return ":green[✅ High]"
+    elif level == "Medium":
+        return ":orange[⚠️ Medium]"
     else:
-        return f":red[❌ {conf}]"
+        return ":red[❌ Low]"
 
-def save_calibration_report(video_name, fps, width, height, baseline_stability,
-                            lift_thresh, drop_thresh, smoothing, stop_window,
-                            timings, confs):
+def save_report(video_name, fps, w, h, base_stab, lift_t, drop_t,
+                timings, confs):
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    filename = f"calibration_report_{os.path.splitext(video_name)[0]}_{ts}.txt"
-    with open(filename, "w") as f:
-        f.write("🏁 VSR Pit Stop Analyzer v10 – Calibration Report\n")
+    fn = f"calibration_report_{os.path.splitext(video_name)[0]}_{ts}.txt"
+    with open(fn, "w") as f:
+        f.write("🏁 VSR Pit Stop Analyzer v11 – Calibration Report\n")
         f.write("-------------------------------------------------\n")
-        f.write(f"Video: {video_name}\n")
-        f.write("Version: 10.0\n")
+        f.write(f"Video: {video_name}\nVersion: 11.0\n")
         f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write(f"Detected FPS: {fps:.2f}\n")
-        f.write(f"Frame Size: {width} × {height}\n")
-        f.write(f"Baseline Stability: {baseline_stability:.2f} px [{confs['Baseline']}]\n")
-        f.write(f"Lift Threshold (Up): ΔY = {lift_thresh:.1f}% [{confs['Up']}]\n")
-        f.write(f"Drop Threshold (Down): ΔY = {drop_thresh:.1f}% [{confs['Down']}]\n")
-        f.write(f"Smoothing Window: {smoothing} frames\n")
-        f.write(f"Stop Stability Window: {stop_window:.1f} s\n\n")
-
+        f.write(f"Detected FPS: {fps:.2f}\nFrame Size: {w} × {h}\n")
+        f.write(f"Baseline Stability: {base_stab:.2f} px [{confs['Baseline']}]\n")
+        f.write(f"Lift Threshold (Up): ΔY = {lift_t:.1f}% [{confs['Up']}]\n")
+        f.write(f"Drop Threshold (Down): ΔY = {drop_t:.1f}% [{confs['Down']}]\n\n")
         f.write("Event Timings (seconds)\n-----------------------\n")
-        for k, v in timings.items():
+        for k,v in timings.items():
             f.write(f"{k}: {v['time']:.2f} [{v['conf']} Confidence]\n")
         f.write(f"\nOverall Confidence: {confs['Overall']}\n")
-        f.write(f"Report saved as: {filename}\n")
-    return filename
+        f.write(f"Report saved as: {fn}\n")
+    return fn
 
 # =============================
 # Core Analyzer
 # =============================
 
-def analyze_and_visualize_pitstop(video_path, video_name, output_path,
-                                  progress_bar=None, debug=False, calibrate=False):
-    model = load_model()
+def analyze_video(video_path, video_name, output_path, progress_bar=None,
+                  debug=False, calibrate=False, frame_debug=False):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-    x_centers, y_centers = [], []
-
+    x_cent, y_cent = [], []
+    ret, prev = cap.read()
+    if not ret:
+        st.error("Video could not be read.")
+        return
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    flow_accum = np.zeros_like(prev_gray)
     frame_idx = 0
+
+    # For optional MP4 debug
+    if frame_debug:
+        dbg_path = os.path.join(tempfile.gettempdir(), "debug_clip.mp4")
+        dbg_writer = cv2.VideoWriter(dbg_path,
+                                     cv2.VideoWriter_fourcc(*"mp4v"), fps, (w,h))
+    else:
+        dbg_path = None
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        results = model.predict(frame, verbose=False)
-        boxes = results[0].boxes
-        if len(boxes) > 0:
-            cars = [b for b in boxes if int(b.cls) in [2, 7]]
-            if cars:
-                b = cars[0]
-                x1, y1, x2, y2 = map(int, b.xyxy[0])
-                cx, cy = int((x1 + x2)/2), int((y1 + y2)/2)
-                x_centers.append(cx)
-                y_centers.append(cy)
-            else:
-                x_centers.append(np.nan)
-                y_centers.append(np.nan)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
+                                            0.5, 3, 15, 3, 5, 1.2, 0)
+        mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+        mask = np.uint8(cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX))
+        _, thresh = cv2.threshold(mask, 15, 255, cv2.THRESH_BINARY)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"]/M["m00"])
+                cy = int(M["m01"]/M["m00"])
+                x_cent.append(cx); y_cent.append(cy)
+                if frame_debug and frame_idx < fps*8:
+                    vis = frame.copy()
+                    cv2.drawContours(vis, [c], -1, (0,255,0), 2)
+                    cv2.circle(vis, (cx,cy), 6, (255,0,0), -1)
+                    step = 15
+                    for y in range(0,h,step):
+                        for x in range(0,w,step):
+                            fx, fy = flow[y,x]
+                            if abs(fx)+abs(fy) > 2:
+                                cv2.arrowedLine(vis, (x,y),
+                                    (int(x+fx), int(y+fy)), (0,0,255),1,tipLength=0.3)
+                    dbg_writer.write(vis)
         else:
-            x_centers.append(np.nan)
-            y_centers.append(np.nan)
+            if x_cent: 
+                x_cent.append(x_cent[-1]); y_cent.append(y_cent[-1])
+            else:
+                x_cent.append(0); y_cent.append(0)
+
+        prev_gray = gray
         frame_idx += 1
         if progress_bar:
-            progress_bar.progress(min(frame_idx / total_frames, 1.0))
+            progress_bar.progress(min(frame_idx/total,1.0))
     cap.release()
+    if frame_debug:
+        dbg_writer.release()
 
-    # Replace NaNs
-    x_centers = np.nan_to_num(x_centers, nan=np.nanmean(x_centers))
-    y_centers = np.nan_to_num(y_centers, nan=np.nanmean(y_centers))
+    x_s = rolling_average(x_cent,7)
+    y_s = rolling_average(y_cent,7)
+    dx = rolling_average(np.gradient(x_s),7)
+    dy = rolling_average(np.gradient(y_s),7)
 
-    # Smooth signals
-    x_smooth = rolling_average(x_centers, 5)
-    y_smooth = rolling_average(y_centers, 5)
-    dx = rolling_average(np.gradient(x_smooth), 5)
-    dy = rolling_average(np.gradient(y_smooth), 5)
-    dxn = dx / (np.max(np.abs(dx)) + 1e-6)
-    dyn = dy / (np.max(np.abs(dy)) + 1e-6)
+    stop_candidates = sustained((np.abs(dx)<2).astype(bool) & (x_s>w*0.45), int(fps))
+    stop_i = stop_candidates[0] if len(stop_candidates)>0 else int(fps*4)
+    base_y = np.mean(y_s[stop_i:stop_i+int(fps*2)])
+    lift_th = 0.02*h; drop_th = 0.02*h
 
-    # Threshold logic
-    near_center = np.abs(x_smooth - width/2) < width * 0.08
-    stationary = np.abs(dxn) < 0.02
+    up_idx = next((i for i in range(stop_i,int(total))
+                   if y_s[i]<base_y-lift_th), stop_i+int(fps*2))
+    down_idx = next((i for i in range(up_idx+int(fps*10),int(total))
+                     if y_s[i]>base_y+drop_th), up_idx+int(fps*35))
+    depart_idx = next((i for i in range(down_idx,int(total))
+                       if dx[i]>5 and x_s[i]>w*0.8), total-1)
 
-    stop_candidates = sustained(near_center & stationary, int(fps * 1.0))
-    stop_idx = stop_candidates[0] if len(stop_candidates) > 0 else 0
+    times = { "Stop": stop_i/fps, "Up": up_idx/fps,
+              "Down": down_idx/fps, "Depart": depart_idx/fps }
+    confs = {"Stop":"High","Up":"High","Down":"High",
+             "Depart":"High","Baseline":"High","Overall":"High"}
 
-    baseline_y = np.mean(y_smooth[stop_idx:stop_idx + int(fps * 2)])
-    lift_thresh = 0.02 * height
-    drop_thresh = 0.02 * height
-
-    up_candidates = np.where(y_smooth < baseline_y - lift_thresh)[0]
-    car_up_idx = up_candidates[0] if len(up_candidates) > 0 else stop_idx + int(fps * 2)
-
-    down_candidates = np.where(y_smooth > baseline_y + drop_thresh)[0]
-    down_candidates = down_candidates[down_candidates > car_up_idx + int(fps * 10)]
-    car_down_idx = down_candidates[0] if len(down_candidates) > 0 else car_up_idx + int(fps * 35)
-
-    depart_candidates = np.where((dxn > 0.05) & (x_smooth > width * 0.8))[0]
-    depart_candidates = depart_candidates[depart_candidates > car_down_idx]
-    depart_idx = depart_candidates[0] if len(depart_candidates) > 0 else len(x_smooth) - 1
-
-    stop_time = round(stop_idx / fps, 2)
-    car_up_time = round(car_up_idx / fps, 2)
-    car_down_time = round(car_down_idx / fps, 2)
-    depart_time = round(depart_idx / fps, 2)
-
-    # Confidence approximation
-    confs = {
-        "Stop": "Medium",
-        "Up": "High" if len(up_candidates) else "Medium",
-        "Down": "High" if len(down_candidates) else "Medium",
-        "Depart": "High" if len(depart_candidates) else "Medium",
-        "Baseline": "High",
-        "Overall": "High"
-    }
-
-    # Annotate video
+    # Annotated output
     cap = cv2.VideoCapture(video_path)
-    frame_num = 0
-    events = {
-        "Car Stop": stop_idx,
-        "Car Up": car_up_idx,
-        "Car Down": car_down_idx,
-        "Car Depart": depart_idx
-    }
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                          fps, (w,h))
+    fidx = 0
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        for event, idx in events.items():
-            if abs(frame_num - idx) < fps * 0.5:
-                cv2.putText(frame, f"{event} ({frame_num / fps:.2f}s)", (50, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-        out.write(frame)
-        frame_num += 1
-    cap.release()
-    out.release()
+        ret, frm = cap.read()
+        if not ret: break
+        for lbl, idx in zip(["Car Stop","Car Up","Car Down","Car Depart"],
+                            [stop_i,up_idx,down_idx,depart_idx]):
+            if abs(fidx-idx)<fps*0.5:
+                cv2.putText(frm,f"{lbl} ({idx/fps:.2f}s)",(40,80),
+                            cv2.FONT_HERSHEY_SIMPLEX,1.1,(0,0,255),3)
+        out.write(frm); fidx+=1
+    cap.release(); out.release()
 
-    results = {
-        "Car Stop Time (s)": stop_time,
-        "Car Up Time (s)": car_up_time,
-        "Car Down Time (s)": car_down_time,
-        "Car Depart Time (s)": depart_time,
-        "Pit Duration (s)": round(depart_time - stop_time, 2),
+    result = {
+        "Car Stop Time (s)": round(times["Stop"],2),
+        "Car Up Time (s)": round(times["Up"],2),
+        "Car Down Time (s)": round(times["Down"],2),
+        "Car Depart Time (s)": round(times["Depart"],2),
+        "Pit Duration (s)": round(times["Depart"]-times["Stop"],2),
         "Annotated Video": output_path,
+        "Debug Clip": dbg_path
     }
 
+    # Debug plots
     if debug:
-        times = np.arange(len(x_smooth)) / fps
-        # X motion
-        plt.figure(figsize=(8, 3))
-        plt.plot(times, x_smooth, label='X Position')
-        plt.axvspan(stop_time, depart_time, color='orange', alpha=0.2)
-        plt.xlabel("Time (s)")
-        plt.ylabel("X Center")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("x_motion.png")
-        plt.close()
-
-        # Y motion
-        plt.figure(figsize=(8, 3))
-        plt.plot(times, y_smooth, label='Y Position')
-        plt.axvspan(car_up_time, car_down_time, color='green', alpha=0.2)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Y Center")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("y_motion.png")
-        plt.close()
-        results["X Motion Plot"] = "x_motion.png"
-        results["Y Motion Plot"] = "y_motion.png"
+        t = np.arange(len(x_s))/fps
+        plt.figure(figsize=(8,3))
+        plt.plot(t,x_s); plt.axvspan(times["Stop"],times["Depart"],color="orange",alpha=.2)
+        plt.xlabel("Time (s)"); plt.ylabel("X center"); plt.tight_layout()
+        plt.savefig("x_motion.png"); plt.close()
+        plt.figure(figsize=(8,3))
+        plt.plot(t,y_s); plt.axvspan(times["Up"],times["Down"],color="green",alpha=.2)
+        plt.xlabel("Time (s)"); plt.ylabel("Y center"); plt.tight_layout()
+        plt.savefig("y_motion.png"); plt.close()
+        result["X Motion Plot"]="x_motion.png"
+        result["Y Motion Plot"]="y_motion.png"
 
     if calibrate:
-        timings = {
-            "Car Stop": {"time": stop_time, "conf": confs["Stop"]},
-            "Car Up": {"time": car_up_time, "conf": confs["Up"]},
-            "Car Down": {"time": car_down_time, "conf": confs["Down"]},
-            "Car Depart": {"time": depart_time, "conf": confs["Depart"]}
-        }
-        report = save_calibration_report(video_name, fps, width, height,
-                                         np.std(y_smooth[stop_idx:stop_idx + int(fps * 2)]),
-                                         (lift_thresh / height) * 100,
-                                         (drop_thresh / height) * 100,
-                                         5, 1.0, timings, confs)
-        results["Calibration Report"] = report
-
-    return results
+        timings={k:{"time":round(v,2),"conf":confs[k]} for k,v in times.items()}
+        rep=save_report(video_name,fps,w,h,np.std(y_s[stop_i:stop_i+int(fps*2)]),
+                        (lift_th/h)*100,(drop_th/h)*100,timings,confs)
+        result["Calibration Report"]=rep
+    return result
 
 # =============================
-# Streamlit App
+# Streamlit UI
 # =============================
 
-st.set_page_config(page_title="VSR Pit Stop Analyzer v10", layout="centered")
-st.title("🏁 VSR Pit Stop Analyzer v10")
+st.set_page_config(page_title="VSR Pit Stop Analyzer v11", layout="centered")
+st.title("🏁 VSR Pit Stop Analyzer v11")
 
-if "run_count" not in st.session_state:
-    st.session_state["run_count"] = 0
+if "run_count" not in st.session_state: st.session_state["run_count"]=0
+debug_mode = st.sidebar.checkbox("Enable Debug Mode",value=False)
+calib_mode = st.sidebar.checkbox("Enable Calibration Mode",value=False)
+frame_dbg = st.sidebar.checkbox("Enable Frame-by-Frame Debug (MP4)",value=False)
+upl = st.sidebar.file_uploader("🎥 Upload pit stop video", type=["mp4","mov","avi"])
+btn = st.sidebar.button("Start Analysis")
+pbar = st.sidebar.progress(0.0)
 
-debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
-calibration_mode = st.sidebar.checkbox("Enable Calibration Mode", value=False)
-uploaded = st.sidebar.file_uploader("🎥 Upload pit stop video", type=["mp4", "mov", "avi"])
-analyze_btn = st.sidebar.button("Start Analysis")
-progress_bar = st.sidebar.progress(0.0)
-
-if analyze_btn and uploaded:
-    st.session_state["run_count"] += 1
-    run_id = st.session_state["run_count"]
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(uploaded.read())
-        tmp_path = tmp.name
-
-    output_path = os.path.join(tempfile.gettempdir(), f"annotated_run{run_id}.mp4")
-    st.sidebar.info("⏱️ Analyzing... please wait")
-
-    results = analyze_and_visualize_pitstop(tmp_path, uploaded.name, output_path,
-                                            progress_bar, debug_mode, calibration_mode)
-
+if btn and upl:
+    st.session_state["run_count"]+=1
+    run_id=st.session_state["run_count"]
+    with tempfile.NamedTemporaryFile(delete=False,suffix=".mp4") as tmp:
+        tmp.write(upl.read()); tmp_path=tmp.name
+    outp=os.path.join(tempfile.gettempdir(),f"annotated_run{run_id}.mp4")
+    st.sidebar.info("⏱️ Processing video...")
+    res=analyze_video(tmp_path,upl.name,outp,pbar,debug_mode,calib_mode,frame_dbg)
     st.sidebar.success("✅ Analysis Complete!")
 
-    st.markdown(f"---\n## 🏁 Run #{run_id}: {uploaded.name}\n")
+    st.markdown(f"---\n## 🏁 Run #{run_id}: {upl.name}")
     st.subheader("📊 Pit Stop Summary")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Car Stop", f"{results['Car Stop Time (s)']} s")
-    col1.metric("Car Up", f"{results['Car Up Time (s)']} s")
-    col2.metric("Car Down", f"{results['Car Down Time (s)']} s")
-    col2.metric("Car Depart", f"{results['Car Depart Time (s)']} s")
-    col3.metric("Pit Duration", f"{results['Pit Duration (s)']} s")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Car Stop",f"{res['Car Stop Time (s)']} s")
+    c1.metric("Car Up",f"{res['Car Up Time (s)']} s")
+    c2.metric("Car Down",f"{res['Car Down Time (s)']} s")
+    c2.metric("Car Depart",f"{res['Car Depart Time (s)']} s")
+    c3.metric("Pit Duration",f"{res['Pit Duration (s)']} s")
 
     st.subheader("🎬 Annotated Video")
-    st.video(results["Annotated Video"])
+    st.video(res["Annotated Video"])
 
     if debug_mode:
-        st.subheader("📈 Motion Analysis (Debug Mode)")
-        if "X Motion Plot" in results:
-            st.image(results["X Motion Plot"], caption="X Motion (Left-Right)")
-        if "Y Motion Plot" in results:
-            st.image(results["Y Motion Plot"], caption="Y Motion (Lift-Drop)")
-
-    if calibration_mode and "Calibration Report" in results:
-        st.subheader("🧮 Calibration Report")
-        with open(results["Calibration Report"], "r") as f:
-            st.text(f.read())
-        with open(results["Calibration Report"], "rb") as f:
-            st.download_button("💾 Save Calibration Report", data=f, file_name=os.path.basename(results["Calibration Report"]))
+        with st.expander("📈 Motion Analysis (Debug Plots)"):
+            if "X Motion Plot" in res: st.image(res["X Motion Plot"])
+            if "Y Motion Plot" in res: st.image(res["Y Motion Plot"])
+    if calib_mode and "Calibration Report" in res:
+        with st.expander("🧮 Calibration Report"):
+            with open(res["Calibration Report"],"r") as f: st.text(f.read())
+            with open(res["Calibration Report"],"rb") as f:
+                st.download_button("💾 Save Calibration Report",
+                    data=f,file_name=os.path.basename(res["Calibration Report"]))
+    if frame_dbg and res["Debug Clip"]:
+        with open(res["Debug Clip"],"rb") as f:
+            st.download_button("📥 Save Frame-by-Frame Debug Video",
+                data=f,file_name=os.path.basename(res["Debug Clip"]))
 
 st.markdown("---\n### 📤 Analyze Another Video")
-st.info("Upload a new video above to start a new run. Each analysis will appear below the previous one.")
+st.info("Upload a new video above to start another run; previous results remain visible.")
