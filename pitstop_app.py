@@ -6,33 +6,26 @@ import tempfile
 import os
 import matplotlib.pyplot as plt
 
-# --- Cache the YOLO model to avoid reloading on every run ---
 @st.cache_resource
 def load_model():
     return YOLO("yolov8n.pt")
 
-# --- Main analysis function ---
 def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4"):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # Prepare writer for annotated video
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
     prev_gray, motion_scores, car_center_y, boxes_list = None, [], [], []
 
-    # --- Pass 1: Collect motion & lift data ---
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7, 7), 0)
-
+        gray = cv2.GaussianBlur(gray, (7,7), 0)
         if prev_gray is not None:
             diff = cv2.absdiff(prev_gray, gray)
             motion_scores.append(np.sum(diff > 25))
@@ -40,9 +33,8 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
 
         results = model.predict(frame, verbose=False)
         boxes = results[0].boxes
-
         if len(boxes) > 0:
-            cars = [b for b in boxes if int(b.cls) in [2, 7]]  # car/truck
+            cars = [b for b in boxes if int(b.cls) in [2,7]]
             if cars:
                 b = cars[0]
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
@@ -58,51 +50,41 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
 
     cap.release()
 
-    # --- Compute signals ---
     motion_scores = np.array(motion_scores)
     car_center_y = np.array(car_center_y)
     fps = max(fps, 1)
     total_frames = len(motion_scores)
     video_duration = total_frames / fps
-
     times = np.arange(len(motion_scores)) / fps
-    motion_smooth = np.convolve(motion_scores, np.ones(15) / 15, mode="same")
-    y_smooth = np.convolve(
-        np.nan_to_num(car_center_y, nan=np.nanmean(car_center_y)), np.ones(5) / 5, mode="same"
-    )
 
-    # --- Adaptive detection logic (duration-safe) ---
+    motion_smooth = np.convolve(motion_scores, np.ones(15)/15, mode='same')
+    y_smooth = np.convolve(np.nan_to_num(car_center_y, nan=np.nanmean(car_center_y)), np.ones(5)/5, mode='same')
+
     stop_threshold = np.percentile(motion_smooth, 20)
     depart_threshold = np.percentile(motion_smooth, 80)
     window = int(fps * 0.5)
-
     stop_idx, depart_idx = 0, total_frames - 1
 
-    # Detect stop
     for i in range(window, total_frames - window):
-        if np.all(motion_smooth[i - window : i] < stop_threshold):
+        if np.all(motion_smooth[i-window:i] < stop_threshold):
             stop_idx = i
             break
 
-    # Detect depart
     for i in range(stop_idx + window, total_frames - window):
-        if np.all(motion_smooth[i - window : i] > depart_threshold):
+        if np.all(motion_smooth[i-window:i] > depart_threshold):
             depart_idx = i
             break
 
-    # Lift & Drop detection
     dy = np.diff(y_smooth)
-    dy_smooth = np.convolve(dy, np.ones(5) / 5, mode="same")
+    dy_smooth = np.convolve(dy, np.ones(5)/5, mode='same')
     up_idx = np.argmin(dy_smooth)
     down_idx = np.argmax(dy_smooth)
 
-    # Convert to seconds
     stop_time = min(stop_idx / fps, video_duration)
     car_up_time = min(up_idx / fps, video_duration)
     car_down_time = min(down_idx / fps, video_duration)
     depart_time = min(depart_idx / fps, video_duration)
 
-    # --- Sanity checks (enforce realistic order & clamp) ---
     if car_up_time < stop_time or (car_up_time - stop_time) > 10:
         car_up_time = stop_time + 2
     if car_down_time < car_up_time or (car_down_time - car_up_time) > 60:
@@ -115,47 +97,35 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     car_down_time = max(0, min(car_down_time, video_duration))
     depart_time = max(0, min(depart_time, video_duration))
 
-    # --- Pass 2: Annotate video ---
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
     events = {
         "Car Stop": int(stop_idx),
         "Car Up": int(up_idx),
         "Car Down": int(down_idx),
-        "Car Depart": int(depart_idx),
+        "Car Depart": int(depart_idx)
     }
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
         if frame_idx < len(boxes_list) and boxes_list[frame_idx] is not None:
             x1, y1, x2, y2 = boxes_list[frame_idx]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
         for event, idx in events.items():
             if abs(frame_idx - idx) < fps * 0.5:
-                cv2.putText(
-                    frame,
-                    f"{event} ({frame_idx / fps:.2f}s)",
-                    (50, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (0, 0, 255),
-                    3,
-                )
-
+                cv2.putText(frame, f"{event} ({frame_idx / fps:.2f}s)", (50, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
         out.write(frame)
         frame_idx += 1
 
     cap.release()
     out.release()
 
-    # --- Optional: Visual signal plot ---
-    plt.figure(figsize=(8, 3))
+    plt.figure(figsize=(8,3))
     plt.plot(times, motion_smooth, label="Motion Intensity")
-    plt.plot(times[: len(dy_smooth)], dy_smooth * 10, label="Lift/Drop Derivative (x10)")
+    plt.plot(times[:len(dy_smooth)], dy_smooth*10, label="Lift/Drop Derivative (x10)")
     plt.axvline(stop_time, color="orange", linestyle="--", label="Stop")
     plt.axvline(car_up_time, color="green", linestyle="--", label="Up")
     plt.axvline(car_down_time, color="red", linestyle="--", label="Down")
@@ -174,38 +144,57 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
         "Car Depart Time (s)": round(depart_time, 2),
         "Pit Duration (s)": round(depart_time - stop_time, 2),
         "Annotated Video": output_path,
-        "Signal Plot": "pitstop_signals.png",
+        "Signal Plot": "pitstop_signals.png"
     }
 
 # --- Streamlit UI ---
-st.set_page_config(page_title="Pit Stop Analyzer v4", layout="wide")
-st.title("🏎️ IMSA Pit Stop Analyzer v4")
+st.set_page_config(page_title="Pit Stop Analyzer v5", layout="centered")
+st.title("🏎️ IMSA Pit Stop Analyzer")
 st.markdown(
     """
     Upload a pit-stop video to automatically detect:
-    - **Car Stop**
-    - **Car Up (on air jacks)**
-    - **Car Down**
-    - **Car Depart**
-
-    This version includes duration-safe adaptive logic and visual debugging plots.
+    - 🟠 **Car Stop**
+    - 🟢 **Car Up (on air jacks)**
+    - 🔴 **Car Down**
+    - 🔵 **Car Depart**
     """
 )
 
-uploaded = st.file_uploader("Upload your pit-stop video", type=["mp4", "mov", "avi"])
+st.markdown("""
+<style>
+    .stMetric label {font-size: 1.1rem !important;}
+    .stMetric {background-color: #f9f9f9; border-radius: 10px; padding: 10px;}
+</style>
+""", unsafe_allow_html=True)
+
+uploaded = st.file_uploader("🎥 Upload your pit-stop video", type=["mp4", "mov", "avi"])
+
 if uploaded:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(uploaded.read())
         tmp_path = tmp.name
 
     st.video(tmp_path)
-    st.info("⏱️ Analyzing… please wait.")
-    output_path = os.path.join(tempfile.gettempdir(), "annotated_pitstop.mp4")
+    st.info("⏱️ Analyzing… please wait ⏳")
 
+    output_path = os.path.join(tempfile.gettempdir(), "annotated_pitstop.mp4")
     results = analyze_and_visualize_pitstop(tmp_path, output_path=output_path)
 
-    st.success("✅ Analysis complete!")
-    st.json(results)
+    st.success("✅ Analysis Complete!")
+    st.subheader("📊 Pit Stop Summary")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Car Stop", f"{results['Car Stop Time (s)']} s")
+    col1.metric("Car Up", f"{results['Car Up Time (s)']} s")
+    col2.metric("Car Down", f"{results['Car Down Time (s)']} s")
+    col2.metric("Car Depart", f"{results['Car Depart Time (s)']} s")
+    col3.metric("Pit Duration", f"{results['Pit Duration (s)']} s")    
+
+    st.divider()
+    st.subheader("🎬 Annotated Video")
     st.video(output_path)
+
     if os.path.exists(results["Signal Plot"]):
-        st.image(results["Signal Plot"], caption="Motion & Lift Signal Plot")
+        st.divider()
+        st.subheader("📈 Motion & Lift Signal Plot")
+        st.image(results["Signal Plot"], caption="Motion and lift signal analysis", use_column_width=True)
