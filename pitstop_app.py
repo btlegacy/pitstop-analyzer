@@ -1,9 +1,7 @@
-# 🏁 VSR Pit Stop Analyzer v12 – Fast Cloud Build (Fixed)
+# 🏁 VSR Pit Stop Analyzer v12.1 – Fast Cloud Build
 # -------------------------------------------------------
-# Adaptive color + optical flow pit stop analyzer optimized
-# for Streamlit Cloud CPU runtimes.
-# Detects Car Stop, Car Up (air wand), Car Down, and Car Depart.
-# Includes calibration report, ROI debug image, and MP4 frame debug.
+# Streamlit-based IMSA pit stop analyzer.
+# Improved Car Stop accuracy & logical event sequencing.
 # -------------------------------------------------------
 
 import streamlit as st
@@ -40,9 +38,9 @@ def save_report(video_name, fps, w, h, direction, base_stab, lift_t, drop_t,
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     fn = f"calibration_report_{os.path.splitext(video_name)[0]}_{ts}.txt"
     with open(fn, "w") as f:
-        f.write("🏁 VSR Pit Stop Analyzer v12 – Calibration Report\n")
+        f.write("🏁 VSR Pit Stop Analyzer v12.1 – Calibration Report\n")
         f.write("-------------------------------------------------\n")
-        f.write(f"Video: {video_name}\nVersion: 12.0 (Fast Cloud Build)\n")
+        f.write(f"Video: {video_name}\nVersion: 12.1 (Fast Cloud Build)\n")
         f.write(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
         f.write(f"Detected FPS: {fps:.2f}\nFrame Size: {w} × {h}\n")
         f.write(f"Pit Direction: {direction}\n")
@@ -80,7 +78,6 @@ def analyze_video(video_path, video_name, output_path,
     prev_small = cv2.resize(prev, (small_w, small_h))
     prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
 
-    # Optional MP4 debug clip
     dbg_path = None
     if frame_debug:
         dbg_path = os.path.join(tempfile.gettempdir(), "debug_clip.mp4")
@@ -143,12 +140,23 @@ def analyze_video(video_path, video_name, output_path,
     direction = "Left → Right" if np.mean(dx[:int(fps * 2)]) > 0 else "Right → Left"
     dir_sign = 1 if direction == "Left → Right" else -1
 
-    # Car Stop detection
-    near_center = (x_s > w * 0.45) if dir_sign == 1 else (x_s < w * 0.55)
-    low_vel = np.abs(dx) < 1.5
-    sustained_stop = sustained(near_center & low_vel, int(fps))
-    stop_i = sustained_stop[0] if len(sustained_stop) > 0 else int(fps * 4)
+    # --- Car Stop detection (improved accuracy) ---
+    near_center = (x_s > w * 0.40) if dir_sign == 1 else (x_s < w * 0.60)
+    low_vel = np.abs(dx) < 1.0
+    sustained_frames = sustained(near_center & low_vel, int(fps))
+    if len(sustained_frames) > 0:
+        first_seq = sustained_frames[0:int(fps)]
+        stop_i = int(np.mean(first_seq)) if len(first_seq) > 0 else sustained_frames[0]
+    else:
+        stop_i = int(fps * 5)
 
+    post_window = int(fps * 0.5)
+    for j in range(stop_i, min(stop_i + post_window, len(dx))):
+        if abs(dx[j]) > 1.2:
+            stop_i = j + int(fps * 0.25)
+            break
+
+    # Baseline for vertical movement
     base_y = np.mean(y_s[stop_i:stop_i + int(fps * 2)])
     base_std = np.std(y_s[stop_i:stop_i + int(fps * 2)])
 
@@ -190,6 +198,14 @@ def analyze_video(video_path, video_name, output_path,
         depart_idx = next((i for i in range(down_idx, len(x_s))
                            if dx[i] < -5 and x_s[i] < w * 0.2), len(x_s) - 1)
 
+    # --- Ensure logical event sequence ---
+    if up_idx <= stop_i:
+        up_idx = stop_i + int(fps * 1.0)
+    if down_idx <= up_idx:
+        down_idx = up_idx + int(fps * 5.0)
+    if depart_idx <= down_idx:
+        depart_idx = down_idx + int(fps * 3.0)
+
     # Annotated output
     cap = cv2.VideoCapture(video_path)
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
@@ -208,6 +224,7 @@ def analyze_video(video_path, video_name, output_path,
     cap.release()
     out.release()
 
+    # Results
     results = {
         "Car Stop Time (s)": round(stop_i / fps, 2),
         "Car Up Time (s)": round(up_idx / fps, 2),
@@ -222,6 +239,7 @@ def analyze_video(video_path, video_name, output_path,
     confs = {"Stop": "High", "Up": "High", "Down": "High",
              "Depart": "High", "Baseline": "High", "Overall": "High"}
 
+    # Debug plots
     if debug:
         t = np.arange(len(x_s)) / fps
         plt.figure(figsize=(8, 3))
@@ -243,6 +261,7 @@ def analyze_video(video_path, video_name, output_path,
         results["X Motion Plot"] = "x_motion.png"
         results["Y Motion Plot"] = "y_motion.png"
 
+    # Calibration report
     if calibrate:
         timings = {}
         for k in ["Car Stop", "Car Up", "Car Down", "Car Depart"]:
@@ -263,8 +282,8 @@ def analyze_video(video_path, video_name, output_path,
 # Streamlit UI
 # =============================
 
-st.set_page_config(page_title="VSR Pit Stop Analyzer v12", layout="centered")
-st.title("🏁 VSR Pit Stop Analyzer v12")
+st.set_page_config(page_title="VSR Pit Stop Analyzer v12.1", layout="centered")
+st.title("🏁 VSR Pit Stop Analyzer v12.1")
 
 if "run_count" not in st.session_state:
     st.session_state["run_count"] = 0
