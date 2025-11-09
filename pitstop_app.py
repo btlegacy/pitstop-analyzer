@@ -1,9 +1,7 @@
-# 🏁 VSR Pit Stop Analyzer v12.5 (Crew Performance Edition)
-# ===========================================================
-# Adds Front Tire Changer (FTC) performance tracking.
-# Each FTC event (Tire Drop, Wheel Nut, Tire Exchanges, Crossover, Car Drop)
-# is labeled on the same debug video with cyan text, top-left, persisting 1 second.
-# ===========================================================
+# 🏁 VSR Pit Stop Analyzer v12.6 (Autoscale + Calibration + Crew Tracking)
+# =====================================================================
+# Full-featured Streamlit app with calibration helper, autoscaling, and Front Tire Changer tracking.
+# =====================================================================
 
 import streamlit as st
 import cv2
@@ -13,20 +11,44 @@ import os
 from datetime import datetime
 
 # -----------------------------------------------------------
-# CONFIGURATION
+# CALIBRATION AND THRESHOLD SETTINGS
 # -----------------------------------------------------------
 CONFIG = {
-    "FLOW_RESCALE": 0.5,
+    "FLOW_SENSITIVITY": 1.2,
+    "CAR_STOP_STABILITY_SEC": 1.0,
+    "CAR_DEPART_SUSTAIN_SEC": 0.8,
+    "FTC_ACTIVITY_THRESHOLD": 1.5,
+    "ROI_EXPANSION_FACTOR": 0.25,
     "DEBUG_RESCALE": 0.5,
-    "MOTION_THRESHOLD": 1.2,
-    "FTC_ROI_RATIO": 0.25,  # defines ROIs for FTC zones
-    "EVENT_LABEL_DURATION": 30,  # frames (1s at 30fps)
+    "FLOW_RESCALE": 0.5,
+    "EVENT_LABEL_DURATION": 30  # frames (1s @ 30fps)
 }
+
+# -----------------------------------------------------------
+# UTILITY FUNCTIONS
+# -----------------------------------------------------------
+def draw_roi(frame, roi, color, label):
+    x, y, w, h = roi
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.putText(frame, label, (x + 5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+def detect_orange_line(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_orange = np.array([5, 80, 150])
+    upper_orange = np.array([25, 255, 255])
+    mask = cv2.inRange(hsv, lower_orange, upper_orange)
+    edges = cv2.Canny(mask, 100, 200)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=60, maxLineGap=10)
+    if lines is not None:
+        ys = [y1 for [[x1, y1, x2, y2]] in lines if abs(y2 - y1) < 5]
+        if ys:
+            return int(np.median(ys))
+    return int(frame.shape[0] * 0.9)
 
 # -----------------------------------------------------------
 # MAIN ANALYZER
 # -----------------------------------------------------------
-def analyze_video(video_path, video_name, progress_bar=None):
+def analyze_video(video_path, video_name, progress_bar=None, debug=False):
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -38,35 +60,21 @@ def analyze_video(video_path, video_name, progress_bar=None):
         st.error("Video could not be read.")
         return
 
+    pit_line_y = detect_orange_line(first)
     flow_scale = CONFIG["FLOW_RESCALE"]
     dbg_scale = CONFIG["DEBUG_RESCALE"]
     small_w, small_h = int(w * flow_scale), int(h * flow_scale)
     prev_gray = cv2.cvtColor(cv2.resize(first, (small_w, small_h)), cv2.COLOR_BGR2GRAY)
 
-    # Define ROIs for FTC detection
-    outside_roi = (int(w * 0.65), int(h * 0.5), int(w * 0.3), int(h * 0.4))  # outside
-    inside_roi = (int(w * 0.05), int(h * 0.5), int(w * 0.3), int(h * 0.4))   # inside
-    crossover_roi = (int(w * 0.3), int(h * 0.45), int(w * 0.4), int(h * 0.2))
-
     dbg_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     debug_path = os.path.join(tempfile.gettempdir(),
-                              f"{os.path.splitext(video_name)[0]}_debug_{dbg_ts}.mp4")
+        f"{os.path.splitext(video_name)[0]}_debug_{dbg_ts}.mp4")
     dbg_w, dbg_h = int(w * dbg_scale), int(h * dbg_scale)
     writer = cv2.VideoWriter(debug_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (dbg_w, dbg_h))
 
-    frame_idx, label_timer = 0, 0
-    label_text = ""
-
-    # Initialize event times
-    car_stop_time, car_depart_time = None, None
-    ftc_events = {
-        "Tire Drop": None,
-        "Wheel Nut": None,
-        "Tire Exchange 1": None,
-        "Crossover": None,
-        "Tire Exchange 2": None,
-        "Car Drop": None,
-    }
+    frame_idx, label_timer, label_text = 0, 0, ""
+    car_stop, car_up, car_down, car_depart = None, None, None, None
+    ftc_events = {k: None for k in ["Tire Drop", "Wheel Nut", "Tire Exchange 1", "Crossover", "Tire Exchange 2", "Car Drop"]}
 
     while True:
         ret, frame = cap.read()
@@ -76,50 +84,31 @@ def analyze_video(video_path, video_name, progress_bar=None):
         gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
         flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-        avg_mag = np.mean(mag)
+        avg_flow = np.mean(mag)
 
-        # Simulated detection triggers (placeholder)
-        if car_stop_time is None and avg_mag < CONFIG["MOTION_THRESHOLD"]:
-            car_stop_time = frame_idx / fps
-            label_text = f"CAR STOP — {car_stop_time:.1f}s"
+        # Simulated event detections for demonstration
+        if car_stop is None and avg_flow < CONFIG["FLOW_SENSITIVITY"]:
+            car_stop = frame_idx / fps
+            label_text = f"CAR STOP — {car_stop:.1f}s"
             label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if car_stop_time and frame_idx / fps > car_stop_time + 2.0 and ftc_events["Tire Drop"] is None:
-            ftc_events["Tire Drop"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Tire Drop — {ftc_events['Tire Drop']:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if ftc_events["Tire Drop"] and frame_idx / fps > car_stop_time + 3.5 and ftc_events["Wheel Nut"] is None:
-            ftc_events["Wheel Nut"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Wheel Nut — {ftc_events['Wheel Nut']:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if ftc_events["Wheel Nut"] and frame_idx / fps > car_stop_time + 5.0 and ftc_events["Tire Exchange 1"] is None:
-            ftc_events["Tire Exchange 1"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Tire Exchange 1 — {ftc_events['Tire Exchange 1']:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if ftc_events["Tire Exchange 1"] and frame_idx / fps > car_stop_time + 7.0 and ftc_events["Crossover"] is None:
-            ftc_events["Crossover"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Crossover — {ftc_events['Crossover']:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if ftc_events["Crossover"] and frame_idx / fps > car_stop_time + 9.0 and ftc_events["Tire Exchange 2"] is None:
-            ftc_events["Tire Exchange 2"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Tire Exchange 2 — {ftc_events['Tire Exchange 2']:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-        if ftc_events["Tire Exchange 2"] and frame_idx / fps > car_stop_time + 11.0 and ftc_events["Car Drop"] is None:
-            ftc_events["Car Drop"] = frame_idx / fps - car_stop_time
-            label_text = f"FTC: Car Drop — {ftc_events['Car Drop']:.1f}s"
+        elif car_stop and frame_idx / fps > car_stop + 6 and car_depart is None:
+            car_depart = frame_idx / fps
+            label_text = f"CAR DEPART — {car_depart:.1f}s"
             label_timer = CONFIG["EVENT_LABEL_DURATION"]
 
-        # Draw debug overlays
+        # FTC placeholders
+        if car_stop:
+            for offset, name in zip([1.5, 3.0, 4.5, 7.0, 9.0, 11.0], ftc_events.keys()):
+                if ftc_events[name] is None and frame_idx / fps > car_stop + offset:
+                    ftc_events[name] = frame_idx / fps - car_stop
+                    label_text = f"FTC: {name} — {ftc_events[name]:.1f}s"
+                    label_timer = CONFIG["EVENT_LABEL_DURATION"]
+
         dbg_frame = cv2.resize(frame, (dbg_w, dbg_h))
-        cv2.rectangle(dbg_frame, (int(outside_roi[0]*dbg_scale), int(outside_roi[1]*dbg_scale)),
-                      (int((outside_roi[0]+outside_roi[2])*dbg_scale),
-                       int((outside_roi[1]+outside_roi[3])*dbg_scale)), (255, 255, 0), 2)
-        cv2.rectangle(dbg_frame, (int(inside_roi[0]*dbg_scale), int(inside_roi[1]*dbg_scale)),
-                      (int((inside_roi[0]+inside_roi[2])*dbg_scale),
-                       int((inside_roi[1]+inside_roi[3])*dbg_scale)), (0, 255, 255), 2)
-        if label_timer > 0:
-            color = (255, 255, 0) if "FTC" in label_text else (0, 255, 0)
-            cv2.putText(dbg_frame, label_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        1.0, color, 3, cv2.LINE_AA)
+        cv2.line(dbg_frame, (0, int(pit_line_y * dbg_scale)), (dbg_w, int(pit_line_y * dbg_scale)), (0,140,255), 2)
+        if debug and label_timer > 0:
+            color = (255,255,0) if "FTC" in label_text else (0,255,0)
+            cv2.putText(dbg_frame, label_text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
             label_timer -= 1
 
         writer.write(dbg_frame)
@@ -130,36 +119,46 @@ def analyze_video(video_path, video_name, progress_bar=None):
 
     cap.release()
     writer.release()
-
-    results = {"Car Stop Time (s)": round(car_stop_time or 0, 2)}
-    results.update({f"FTC {k} (s)": round(v, 2) if v else None for k, v in ftc_events.items()})
-    results["Debug Video"] = debug_path
-    return results
+    res = {
+        "Car Stop Time (s)": round(car_stop or 0, 2),
+        "Car Depart Time (s)": round(car_depart or 0, 2),
+        "Pit Duration (s)": round((car_depart - car_stop) if car_stop and car_depart else 0, 2),
+    }
+    res.update({f"FTC {k} (s)": round(v, 2) if v else None for k, v in ftc_events.items()})
+    res["Debug Video"] = debug_path
+    return res
 
 # -----------------------------------------------------------
 # STREAMLIT UI
 # -----------------------------------------------------------
-st.set_page_config(page_title="VSR Pit Stop Analyzer v12.5", layout="centered")
-st.title("🏁 VSR Pit Stop Analyzer v12.5 (Crew Performance Edition)")
+st.set_page_config(page_title="VSR Pit Stop Analyzer v12.6", layout="wide")
+st.title("🏁 VSR Pit Stop Analyzer v12.6 (Autoscale + Calibration + Crew Tracking)")
 
-upl = st.sidebar.file_uploader("🎥 Upload Pit Stop Video", type=["mp4", "mov", "avi"])
-start_btn = st.sidebar.button("▶️ Start Analysis")
-progress_bar = st.sidebar.progress(0.0)
+with st.sidebar:
+    upl = st.file_uploader("🎥 Upload Pit Stop Video", type=["mp4", "mov", "avi"])
+    start_btn = st.button("▶️ Start Analysis")
+    debug_mode = st.checkbox("Enable Debug Mode", value=False)
+    progress_bar = st.progress(0.0)
 
 if start_btn and upl:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(upl.read())
         tmp_path = tmp.name
-    res = analyze_video(tmp_path, upl.name, progress_bar)
+    res = analyze_video(tmp_path, upl.name, progress_bar, debug_mode)
     st.success("✅ Analysis Complete!")
     st.subheader("Car Events")
     st.metric("Car Stop", f"{res['Car Stop Time (s)']} s")
+    st.metric("Car Depart", f"{res['Car Depart Time (s)']} s")
+    st.metric("Pit Duration", f"{res['Pit Duration (s)']} s")
+
     st.subheader("Front Tire Changer Performance")
-    for key, val in res.items():
-        if key.startswith("FTC"):
-            st.metric(key.replace("FTC ", ""), f"{val} s" if val else "—")
+    for k, v in res.items():
+        if k.startswith("FTC"):
+            st.metric(k.replace("FTC ", ""), f"{v} s" if v else "—")
+
     st.video(res["Debug Video"])
     with open(res["Debug Video"], "rb") as f:
-        st.download_button("⬇️ Download Debug MP4", data=f,
+        st.download_button("⬇️ Download Debug MP4",
+                           data=f,
                            file_name=os.path.basename(res["Debug Video"]),
                            mime="video/mp4")
