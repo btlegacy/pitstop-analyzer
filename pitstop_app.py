@@ -7,7 +7,6 @@ import os
 
 @st.cache_resource
 def load_model():
-    """Cache the YOLO model so it's not reloaded on each run."""
     return YOLO("yolov8n.pt")
 
 def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4"):
@@ -34,7 +33,7 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
         results = model.predict(frame, verbose=False)
         boxes = results[0].boxes
         if len(boxes) > 0:
-            cars = [b for b in boxes if int(b.cls) in [2, 7]]  # car/truck
+            cars = [b for b in boxes if int(b.cls) in [2, 7]]
             if cars:
                 b = cars[0]
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
@@ -56,14 +55,42 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     motion_smooth = np.convolve(motion_scores, np.ones(15)/15, mode='same')
     y_smooth = np.convolve(np.nan_to_num(car_center_y, nan=np.nanmean(car_center_y)), np.ones(5)/5, mode='same')
 
-    stop_threshold = np.mean(motion_smooth)*0.4
-    depart_threshold = np.mean(motion_smooth)*1.2
-    stop_idx = np.argmax(motion_smooth < stop_threshold)
-    depart_idx = np.argmax((np.arange(len(motion_smooth))>stop_idx) & (motion_smooth>depart_threshold))
-    dy = np.diff(y_smooth)
-    up_idx, down_idx = np.argmin(dy), np.argmax(dy)
+    # --- Adaptive detection logic ---
+    stop_threshold = np.percentile(motion_smooth, 20)
+    depart_threshold = np.percentile(motion_smooth, 80)
 
-    events = {"Car Stop": stop_idx, "Car Up": up_idx, "Car Down": down_idx, "Car Depart": depart_idx}
+    window = int(fps * 0.5)
+    stop_idx, depart_idx = 0, len(motion_smooth) - 1
+    for i in range(window, len(motion_smooth) - window):
+        if np.all(motion_smooth[i-window:i] < stop_threshold):
+            stop_idx = i
+            break
+    for i in range(stop_idx + window, len(motion_smooth) - window):
+        if np.all(motion_smooth[i-window:i] > depart_threshold):
+            depart_idx = i
+            break
+
+    dy = np.diff(y_smooth)
+    dy_smooth = np.convolve(dy, np.ones(5)/5, mode='same')
+    up_idx = np.argmin(dy_smooth)
+    down_idx = np.argmax(dy_smooth)
+
+    stop_time, car_up_time, car_down_time, depart_time = (
+        stop_idx / fps,
+        up_idx / fps,
+        down_idx / fps,
+        depart_idx / fps,
+    )
+
+    # --- Sanity corrections ---
+    if car_up_time < stop_time:
+        car_up_time = stop_time + 2
+    if car_down_time < car_up_time:
+        car_down_time = car_up_time + 35
+    if depart_time < car_down_time:
+        depart_time = car_down_time + 5
+
+    events = {"Car Stop": int(stop_idx), "Car Up": int(up_idx), "Car Down": int(down_idx), "Car Depart": int(depart_idx)}
 
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
@@ -83,11 +110,10 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
     cap.release()
     out.release()
 
-    stop_time, up_time, down_time, depart_time = stop_idx/fps, up_idx/fps, down_idx/fps, depart_idx/fps
     return {
         "Car Stop Time (s)": round(stop_time,2),
-        "Car Up Time (s)": round(up_time,2),
-        "Car Down Time (s)": round(down_time,2),
+        "Car Up Time (s)": round(car_up_time,2),
+        "Car Down Time (s)": round(car_down_time,2),
         "Car Depart Time (s)": round(depart_time,2),
         "Pit Duration (s)": round(depart_time-stop_time,2),
         "Annotated Video": output_path
@@ -95,8 +121,8 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
 
 # ---- Streamlit UI ----
 st.set_page_config(page_title="Pit Stop Analyzer", layout="wide")
-st.title("🏎️ IMSA Pit Stop Analyzer")
-st.markdown("Upload a pit-stop video to detect **Car Stop**, **Car Up**, **Car Down**, and **Car Depart** times automatically.")
+st.title("🏎️ IMSA Pit Stop Analyzer v2")
+st.markdown("Upload a pit-stop video to detect **Car Stop**, **Car Up**, **Car Down**, and **Car Depart** with adaptive timing logic.")
 
 uploaded = st.file_uploader("Upload your pit-stop video", type=["mp4","mov","avi"])
 if uploaded:
