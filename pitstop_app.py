@@ -4,27 +4,35 @@ import numpy as np
 from ultralytics import YOLO
 import tempfile
 import os
+import matplotlib.pyplot as plt
 
+# --- Cache the YOLO model to avoid reloading on every run ---
 @st.cache_resource
 def load_model():
     return YOLO("yolov8n.pt")
 
+# --- Main analysis function ---
 def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4"):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # Prepare writer for annotated video
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
     prev_gray, motion_scores, car_center_y, boxes_list = None, [], [], []
 
+    # --- Pass 1: Collect motion & lift data ---
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (7,7), 0)
+        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
         if prev_gray is not None:
             diff = cv2.absdiff(prev_gray, gray)
             motion_scores.append(np.sum(diff > 25))
@@ -32,14 +40,15 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
 
         results = model.predict(frame, verbose=False)
         boxes = results[0].boxes
+
         if len(boxes) > 0:
-            cars = [b for b in boxes if int(b.cls) in [2, 7]]
+            cars = [b for b in boxes if int(b.cls) in [2, 7]]  # car/truck
             if cars:
                 b = cars[0]
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
-                y_center = int((y1 + y2)/2)
+                y_center = int((y1 + y2) / 2)
                 car_center_y.append(y_center)
-                boxes_list.append((x1,y1,x2,y2))
+                boxes_list.append((x1, y1, x2, y2))
             else:
                 car_center_y.append(np.nan)
                 boxes_list.append(None)
@@ -48,93 +57,155 @@ def analyze_and_visualize_pitstop(video_path, output_path="pitstop_annotated.mp4
             boxes_list.append(None)
 
     cap.release()
+
+    # --- Compute signals ---
     motion_scores = np.array(motion_scores)
     car_center_y = np.array(car_center_y)
     fps = max(fps, 1)
-    times = np.arange(len(motion_scores))/fps
-    motion_smooth = np.convolve(motion_scores, np.ones(15)/15, mode='same')
-    y_smooth = np.convolve(np.nan_to_num(car_center_y, nan=np.nanmean(car_center_y)), np.ones(5)/5, mode='same')
+    total_frames = len(motion_scores)
+    video_duration = total_frames / fps
 
-    # --- Adaptive detection logic ---
+    times = np.arange(len(motion_scores)) / fps
+    motion_smooth = np.convolve(motion_scores, np.ones(15) / 15, mode="same")
+    y_smooth = np.convolve(
+        np.nan_to_num(car_center_y, nan=np.nanmean(car_center_y)), np.ones(5) / 5, mode="same"
+    )
+
+    # --- Adaptive detection logic (duration-safe) ---
     stop_threshold = np.percentile(motion_smooth, 20)
     depart_threshold = np.percentile(motion_smooth, 80)
-
     window = int(fps * 0.5)
-    stop_idx, depart_idx = 0, len(motion_smooth) - 1
-    for i in range(window, len(motion_smooth) - window):
-        if np.all(motion_smooth[i-window:i] < stop_threshold):
+
+    stop_idx, depart_idx = 0, total_frames - 1
+
+    # Detect stop
+    for i in range(window, total_frames - window):
+        if np.all(motion_smooth[i - window : i] < stop_threshold):
             stop_idx = i
             break
-    for i in range(stop_idx + window, len(motion_smooth) - window):
-        if np.all(motion_smooth[i-window:i] > depart_threshold):
+
+    # Detect depart
+    for i in range(stop_idx + window, total_frames - window):
+        if np.all(motion_smooth[i - window : i] > depart_threshold):
             depart_idx = i
             break
 
+    # Lift & Drop detection
     dy = np.diff(y_smooth)
-    dy_smooth = np.convolve(dy, np.ones(5)/5, mode='same')
+    dy_smooth = np.convolve(dy, np.ones(5) / 5, mode="same")
     up_idx = np.argmin(dy_smooth)
     down_idx = np.argmax(dy_smooth)
 
-    stop_time, car_up_time, car_down_time, depart_time = (
-        stop_idx / fps,
-        up_idx / fps,
-        down_idx / fps,
-        depart_idx / fps,
-    )
+    # Convert to seconds
+    stop_time = min(stop_idx / fps, video_duration)
+    car_up_time = min(up_idx / fps, video_duration)
+    car_down_time = min(down_idx / fps, video_duration)
+    depart_time = min(depart_idx / fps, video_duration)
 
-    # --- Sanity corrections ---
-    if car_up_time < stop_time:
+    # --- Sanity checks (enforce realistic order & clamp) ---
+    if car_up_time < stop_time or (car_up_time - stop_time) > 10:
         car_up_time = stop_time + 2
-    if car_down_time < car_up_time:
-        car_down_time = car_up_time + 35
-    if depart_time < car_down_time:
+    if car_down_time < car_up_time or (car_down_time - car_up_time) > 60:
+        car_down_time = car_up_time + 36
+    if depart_time < car_down_time or (depart_time - car_down_time) > 10:
         depart_time = car_down_time + 5
 
-    events = {"Car Stop": int(stop_idx), "Car Up": int(up_idx), "Car Down": int(down_idx), "Car Depart": int(depart_idx)}
+    stop_time = max(0, min(stop_time, video_duration))
+    car_up_time = max(0, min(car_up_time, video_duration))
+    car_down_time = max(0, min(car_down_time, video_duration))
+    depart_time = max(0, min(depart_time, video_duration))
 
+    # --- Pass 2: Annotate video ---
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
+    events = {
+        "Car Stop": int(stop_idx),
+        "Car Up": int(up_idx),
+        "Car Down": int(down_idx),
+        "Car Depart": int(depart_idx),
+    }
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+
         if frame_idx < len(boxes_list) and boxes_list[frame_idx] is not None:
             x1, y1, x2, y2 = boxes_list[frame_idx]
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
         for event, idx in events.items():
-            if abs(frame_idx-idx) < fps*0.5:
-                cv2.putText(frame,f"{event} ({frame_idx/fps:.2f}s)",(50,80),
-                            cv2.FONT_HERSHEY_SIMPLEX,1.2,(0,0,255),3)
+            if abs(frame_idx - idx) < fps * 0.5:
+                cv2.putText(
+                    frame,
+                    f"{event} ({frame_idx / fps:.2f}s)",
+                    (50, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    (0, 0, 255),
+                    3,
+                )
+
         out.write(frame)
         frame_idx += 1
+
     cap.release()
     out.release()
 
+    # --- Optional: Visual signal plot ---
+    plt.figure(figsize=(8, 3))
+    plt.plot(times, motion_smooth, label="Motion Intensity")
+    plt.plot(times[: len(dy_smooth)], dy_smooth * 10, label="Lift/Drop Derivative (x10)")
+    plt.axvline(stop_time, color="orange", linestyle="--", label="Stop")
+    plt.axvline(car_up_time, color="green", linestyle="--", label="Up")
+    plt.axvline(car_down_time, color="red", linestyle="--", label="Down")
+    plt.axvline(depart_time, color="blue", linestyle="--", label="Depart")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Signal Level")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("pitstop_signals.png")
+    plt.close()
+
     return {
-        "Car Stop Time (s)": round(stop_time,2),
-        "Car Up Time (s)": round(car_up_time,2),
-        "Car Down Time (s)": round(car_down_time,2),
-        "Car Depart Time (s)": round(depart_time,2),
-        "Pit Duration (s)": round(depart_time-stop_time,2),
-        "Annotated Video": output_path
+        "Car Stop Time (s)": round(stop_time, 2),
+        "Car Up Time (s)": round(car_up_time, 2),
+        "Car Down Time (s)": round(car_down_time, 2),
+        "Car Depart Time (s)": round(depart_time, 2),
+        "Pit Duration (s)": round(depart_time - stop_time, 2),
+        "Annotated Video": output_path,
+        "Signal Plot": "pitstop_signals.png",
     }
 
-# ---- Streamlit UI ----
-st.set_page_config(page_title="Pit Stop Analyzer", layout="wide")
-st.title("🏎️ IMSA Pit Stop Analyzer v2")
-st.markdown("Upload a pit-stop video to detect **Car Stop**, **Car Up**, **Car Down**, and **Car Depart** with adaptive timing logic.")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Pit Stop Analyzer v4", layout="wide")
+st.title("🏎️ IMSA Pit Stop Analyzer v4")
+st.markdown(
+    """
+    Upload a pit-stop video to automatically detect:
+    - **Car Stop**
+    - **Car Up (on air jacks)**
+    - **Car Down**
+    - **Car Depart**
 
-uploaded = st.file_uploader("Upload your pit-stop video", type=["mp4","mov","avi"])
+    This version includes duration-safe adaptive logic and visual debugging plots.
+    """
+)
+
+uploaded = st.file_uploader("Upload your pit-stop video", type=["mp4", "mov", "avi"])
 if uploaded:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(uploaded.read())
         tmp_path = tmp.name
 
     st.video(tmp_path)
-    st.write("⏱️ Analyzing… please wait.")
+    st.info("⏱️ Analyzing… please wait.")
     output_path = os.path.join(tempfile.gettempdir(), "annotated_pitstop.mp4")
+
     results = analyze_and_visualize_pitstop(tmp_path, output_path=output_path)
 
     st.success("✅ Analysis complete!")
     st.json(results)
     st.video(output_path)
+    if os.path.exists(results["Signal Plot"]):
+        st.image(results["Signal Plot"], caption="Motion & Lift Signal Plot")
