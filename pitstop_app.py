@@ -34,6 +34,37 @@ CONFIG = {
     "EVENT_LABEL_DURATION": 30,       # Frames to display overlay label (~1 sec @ 30fps)
     "FLOW_VECTOR_SPACING": 8          # Pixel spacing for debug flow arrows
 }
+# -----------------------------------------------------------
+# CALIBRATION PREVIEW FUNCTION
+# -----------------------------------------------------------
+def calibration_preview(frame):
+    """Draws static calibration overlays to verify ROI alignment."""
+    try:
+        h, w, _ = frame.shape
+
+        # Example ROIs (same as in car + FTC tracking)
+        car_roi = (int(w * 0.2), int(h * 0.4), int(w * 0.6), int(h * 0.25))
+        ftc_outside_roi = (int(w * 0.65), int(h * 0.5), int(w * 0.3), int(h * 0.4))
+        ftc_inside_roi = (int(w * 0.05), int(h * 0.5), int(w * 0.3), int(h * 0.4))
+
+        overlay = frame.copy()
+
+        # Draw ROIs
+        draw_roi(overlay, car_roi, (0, 255, 0), "Car ROI")
+        draw_roi(overlay, ftc_outside_roi, (255, 255, 0), "FTC Outside")
+        draw_roi(overlay, ftc_inside_roi, (255, 255, 0), "FTC Inside")
+
+        # Draw reference pit lines
+        pit_line_x = int(w * 0.5)
+        cv2.line(overlay, (pit_line_x, 0), (pit_line_x, h), (0, 165, 255), 2)
+        cv2.putText(overlay, "Reference Pit Line", (pit_line_x + 10, int(h * 0.05)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
+
+        return overlay
+
+    except Exception as e:
+        print(f"[Calibration Error] {e}")
+        return np.zeros((480, 640, 3), dtype=np.uint8)
 
 # -----------------------------------------------------------
 # DRAWING & VISUAL UTILITIES
@@ -392,6 +423,8 @@ def track_ftc(video_path, car_stop_time, fps, w, h, debug=False):
 
     cap.release()
     return ftc_events
+
+
 # -----------------------------------------------------------
 # STREAMLIT USER INTERFACE + COMBINED ANALYSIS LOGIC
 # -----------------------------------------------------------
