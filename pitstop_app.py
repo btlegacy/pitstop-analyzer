@@ -1,561 +1,302 @@
-# 🏁 VSR Pit Stop Analyzer v12.8 (Precision + Crew Edition)
-# ==========================================================
-# Full production version combining:
-# - Car Stop / Up / Down / Depart logic (optical flow + ROI-based detection)
-# - Front Tire Changer (FTC) performance tracking
-# - Autoscaling (720p–4K)
-# - Calibration & Debug Modes
-# - Max-detail optical flow visualization (every 5–10 px)
-# - Fully Streamlit-ready layout
-# ==========================================================
+# ============================================================
+# 🏁 VSR Pit Stop Analyzer v12.9 (Precision + Crew Edition)
+# ------------------------------------------------------------
+# Complete, production-ready Streamlit application for analyzing
+# racing pit stops using optical flow and object motion tracking.
+# Includes Car Events + Front Tire Changer performance stats.
+# ============================================================
 
 import streamlit as st
 import cv2
 import numpy as np
 import tempfile
 import os
-from datetime import datetime
+import datetime
 
-# -----------------------------------------------------------
-# CONFIGURATION & THRESHOLD SETTINGS
-# -----------------------------------------------------------
-CONFIG = {
-    # Optical flow tuning
-    "FLOW_SENSITIVITY": 1.2,          # Base motion threshold for horizontal flow
-    "VERTICAL_FLOW_SENSITIVITY": 0.9, # For detecting air jack lift/drop
-    "FLOW_RESCALE": 0.5,              # Processing resolution scale
-    "DEBUG_RESCALE": 0.5,             # Output resolution scale
+# ============================================================
+# STREAMLIT PAGE CONFIGURATION
+# ============================================================
+st.set_page_config(page_title="VSR Pit Stop Analyzer v12.9",
+                   layout="wide",
+                   page_icon="🏁")
 
-    # Event timing filters
-    "CAR_STOP_STABILITY_SEC": 1.0,    # Required stability before confirming stop
-    "CAR_DEPART_SUSTAIN_SEC": 0.8,    # Sustained motion duration for depart
-    "FTC_ACTIVITY_THRESHOLD": 1.4,    # Crew motion trigger level
-    "ROI_EXPANSION_FACTOR": 0.25,     # ROI padding to handle tilt
-    "EVENT_LABEL_DURATION": 30,       # Frames to display overlay label (~1 sec @ 30fps)
-    "FLOW_VECTOR_SPACING": 8          # Pixel spacing for debug flow arrows
-}
-# -----------------------------------------------------------
+# ============================================================
+# DRAW HELPER (ROI BOXES + LABELS)
+# ============================================================
+def draw_roi(frame, roi, color=(0, 255, 0), label="ROI"):
+    """Draws a labeled bounding box for calibration/debug overlays."""
+    x, y, w, h = roi
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.putText(frame, label, (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+# ============================================================
+# FLOW FIELD VISUALIZATION (DEBUG OVERLAY)
+# ============================================================
+def draw_flow_field(frame, flow, step=16, scale=5):
+    """Draws dense optical flow vectors with automatic shape handling."""
+    try:
+        h, w = flow.shape[:2]
+        y, x = np.mgrid[step / 2:h:step, step / 2:w:step].astype(np.int32)
+
+        fx, fy = flow[y, x].T
+        if fx.shape != fy.shape:
+            min_h, min_w = min(fx.shape[0], fy.shape[0]), min(fx.shape[1], fy.shape[1])
+            fx, fy = fx[:min_h, :min_w], fy[:min_h, :min_w]
+            x, y = x[:min_h, :min_w], y[:min_h, :min_w]
+
+        lines = np.vstack([
+            x.flatten(),
+            y.flatten(),
+            (x + fx * scale).flatten(),
+            (y + fy * scale).flatten()
+        ]).T.reshape(-1, 2, 2)
+
+        vis = frame.copy()
+        for (x1, y1), (x2, y2) in lines.astype(np.int32):
+            cv2.arrowedLine(vis, (x1, y1), (x2, y2), (0, 0, 255), 1, tipLength=0.3)
+        return vis
+    except Exception as e:
+        print(f"[Flow Visualization Error] {e}")
+        return frame
+# ============================================================
 # CALIBRATION PREVIEW FUNCTION
-# -----------------------------------------------------------
+# ============================================================
 def calibration_preview(frame):
-    """Draws static calibration overlays to verify ROI alignment."""
+    """Draws calibration overlays to verify ROIs."""
     try:
         h, w, _ = frame.shape
-
-        # Example ROIs (same as in car + FTC tracking)
         car_roi = (int(w * 0.2), int(h * 0.4), int(w * 0.6), int(h * 0.25))
         ftc_outside_roi = (int(w * 0.65), int(h * 0.5), int(w * 0.3), int(h * 0.4))
         ftc_inside_roi = (int(w * 0.05), int(h * 0.5), int(w * 0.3), int(h * 0.4))
 
         overlay = frame.copy()
-
-        # Draw ROIs
         draw_roi(overlay, car_roi, (0, 255, 0), "Car ROI")
         draw_roi(overlay, ftc_outside_roi, (255, 255, 0), "FTC Outside")
         draw_roi(overlay, ftc_inside_roi, (255, 255, 0), "FTC Inside")
 
-        # Draw reference pit lines
         pit_line_x = int(w * 0.5)
         cv2.line(overlay, (pit_line_x, 0), (pit_line_x, h), (0, 165, 255), 2)
         cv2.putText(overlay, "Reference Pit Line", (pit_line_x + 10, int(h * 0.05)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2, cv2.LINE_AA)
-
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
         return overlay
-
-    except Exception as e:
-        print(f"[Calibration Error] {e}")
+    except Exception:
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-# -----------------------------------------------------------
-# DRAWING & VISUAL UTILITIES
-# -----------------------------------------------------------
-def draw_roi(frame, roi, color, label=None):
-    """Draws a rectangular ROI on a frame with an optional label."""
-    x, y, w, h = roi
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-    if label:
-        cv2.putText(frame, label, (x + 5, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-
-def draw_flow_field(frame, flow, step=8, scale=1.0, color=(255, 0, 0)):
-    """Draw optical flow vectors on frame for debug visualization."""
-    h, w = flow.shape[:2]
-    y, x = np.mgrid[step//2:h:step, step//2:w:step].astype(int)
-    fx, fy = flow[y, x].T
-    lines = np.vstack([x, y, x + fx * scale, y + fy * scale]).T.reshape(-1, 2, 2)
-    lines = np.int32(lines + 0.5)
-    vis = frame.copy()
-    for (x1, y1), (x2, y2) in lines:
-        cv2.arrowedLine(vis, (x1, y1), (x2, y2), color, 1, tipLength=0.3)
-    return vis
-
-def detect_orange_line(frame):
-    """Detects the bright orange pit line to anchor horizontal car motion."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_orange = np.array([5, 80, 150])
-    upper_orange = np.array([25, 255, 255])
-    mask = cv2.inRange(hsv, lower_orange, upper_orange)
-    edges = cv2.Canny(mask, 100, 200)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 50, minLineLength=60, maxLineGap=10)
-    if lines is not None:
-        ys = [y1 for [[x1, y1, x2, y2]] in lines if abs(y2 - y1) < 5]
-        if ys:
-            return int(np.median(ys))
-    return int(frame.shape[0] * 0.85)
-
-# -----------------------------------------------------------
-# CALIBRATION MODE VISUALIZATION
-# -----------------------------------------------------------
-def calibration_preview(frame):
-    """Displays automatically scaled ROIs to verify correct alignment."""
-    h, w = frame.shape[:2]
-    car_roi = (int(w * 0.25), int(h * 0.35), int(w * 0.5), int(h * 0.4))
-    outside_roi = (int(w * 0.65), int(h * 0.5), int(w * 0.3), int(h * 0.4))
-    inside_roi = (int(w * 0.05), int(h * 0.5), int(w * 0.3), int(h * 0.4))
-    crossover_roi = (int(w * 0.35), int(h * 0.45), int(w * 0.3), int(h * 0.25))
-    pit_line_y = detect_orange_line(frame)
-
-    calib_frame = frame.copy()
-    draw_roi(calib_frame, car_roi, (0, 255, 0), "Car ROI")
-    draw_roi(calib_frame, outside_roi, (255, 255, 0), "Outside ROI")
-    draw_roi(calib_frame, inside_roi, (255, 255, 0), "Inside ROI")
-    draw_roi(calib_frame, crossover_roi, (0, 165, 255), "Crossover ROI")
-    cv2.line(calib_frame, (0, pit_line_y), (w, pit_line_y), (0, 140, 255), 2)
-    cv2.putText(calib_frame, "Calibration Mode - Verify ROI Alignment",
-                (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
-    return calib_frame
-# -----------------------------------------------------------
-# MAIN ANALYSIS ENGINE — CAR EVENT DETECTION
-# -----------------------------------------------------------
-def analyze_video(video_path, video_name, progress_bar=None, debug=False):
-    """Processes video frame-by-frame to detect car and crew events."""
-
+# ============================================================
+# CAR EVENT DETECTION
+# ============================================================
+def analyze_car_events(video_path, debug=False):
+    """Analyzes car stop, up, down, and depart based on optical flow in the car ROI."""
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    # Read first frame
-    ret, first = cap.read()
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    ret, prev_frame = cap.read()
     if not ret:
-        st.error("Unable to read video.")
-        return None
+        return {}
 
-    # Autoscaled ROIs (relative coordinates)
-    car_roi = (int(w * 0.25), int(h * 0.35), int(w * 0.5), int(h * 0.4))
-    pit_line_y = detect_orange_line(first)
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    h, w = prev_gray.shape
+    roi = (int(w * 0.25), int(h * 0.35), int(w * 0.5), int(h * 0.3))
 
-    # Flow pre-processing
-    flow_scale = CONFIG["FLOW_RESCALE"]
-    small_w, small_h = int(w * flow_scale), int(h * flow_scale)
-    prev_gray = cv2.cvtColor(cv2.resize(first, (small_w, small_h)), cv2.COLOR_BGR2GRAY)
-
-    # Debug writer setup
-    dbg_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    dbg_name = f"{os.path.splitext(video_name)[0]}_debug_{dbg_ts}.mp4"
-    debug_path = os.path.join(tempfile.gettempdir(), dbg_name)
-    dbg_w, dbg_h = int(w * CONFIG["DEBUG_RESCALE"]), int(h * CONFIG["DEBUG_RESCALE"])
-    writer = cv2.VideoWriter(debug_path,
-                             cv2.VideoWriter_fourcc(*"mp4v"),
-                             fps,
-                             (dbg_w, dbg_h))
-
-    # Event state tracking
+    motion_mags = []
     frame_idx = 0
-    label_timer = 0
-    label_text = ""
+    events = {"Car Stop Time (s)": None, "Car Up Time (s)": None,
+              "Car Down Time (s)": None, "Car Depart Time (s)": None,
+              "Pit Duration (s)": None}
 
-    car_stop = None
-    car_up = None
-    car_down = None
-    car_depart = None
-    motion_buffer = []   # stores rolling horizontal flow averages
-    vertical_buffer = [] # stores rolling vertical flow averages
-
-    # -------------------------------------------------------
-    # Helper: sustained-motion test
-    # -------------------------------------------------------
-    def sustained_motion(buffer, threshold, frames_required):
-        """Returns True if avg motion exceeds threshold for N consecutive frames."""
-        if len(buffer) < frames_required:
-            return False
-        recent = buffer[-frames_required:]
-        return np.mean(np.abs(recent)) > threshold
-
-    # -------------------------------------------------------
-    # Frame loop
-    # -------------------------------------------------------
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Resize + gray for optical flow
-        frame_small = cv2.resize(frame, (small_w, small_h))
-        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
-
-        # Compute optical flow
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
-        fx, fy = flow[..., 0], flow[..., 1]
-        horiz_mean = np.mean(np.abs(fx))
-        vert_mean = np.mean(fy)
-        motion_buffer.append(horiz_mean)
-        vertical_buffer.append(vert_mean)
-
-        # Limit buffer length (approx 2 seconds)
-        max_len = int(fps * 2)
-        if len(motion_buffer) > max_len:
-            motion_buffer.pop(0)
-            vertical_buffer.pop(0)
-
-        # ---------------------------------------------------
-        # CAR EVENT DETECTION
-        # ---------------------------------------------------
-        # 1. Car Stop — must be still for configured seconds
-        if car_stop is None and not sustained_motion(motion_buffer,
-                                                     CONFIG["FLOW_SENSITIVITY"],
-                                                     int(fps * CONFIG["CAR_STOP_STABILITY_SEC"])):
-            car_stop = frame_idx / fps
-            label_text = f"CAR STOP — {car_stop:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-
-        # 2. Car Up — vertical motion toward top (negative fy)
-        if car_stop and car_up is None and np.mean(vertical_buffer) < -CONFIG["VERTICAL_FLOW_SENSITIVITY"]:
-            car_up = frame_idx / fps
-            label_text = f"CAR UP — {car_up:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-
-        # 3. Car Down — positive vertical flow after Up
-        if car_up and car_down is None and np.mean(vertical_buffer) > CONFIG["VERTICAL_FLOW_SENSITIVITY"]:
-            car_down = frame_idx / fps
-            label_text = f"CAR DOWN — {car_down:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-
-        # 4. Car Depart — sustained rightward motion (fx > threshold)
-        if car_down and car_depart is None and sustained_motion(motion_buffer,
-                                                                CONFIG["FLOW_SENSITIVITY"],
-                                                                int(fps * CONFIG["CAR_DEPART_SUSTAIN_SEC"])):
-            car_depart = frame_idx / fps
-            label_text = f"CAR DEPART — {car_depart:.1f}s"
-            label_timer = CONFIG["EVENT_LABEL_DURATION"]
-
-        # ---------------------------------------------------
-        # DEBUG FRAME GENERATION
-        # ---------------------------------------------------
-        dbg_frame = cv2.resize(frame, (dbg_w, dbg_h))
-        cv2.line(dbg_frame,
-                 (0, int(pit_line_y * CONFIG["DEBUG_RESCALE"])),
-                 (dbg_w, int(pit_line_y * CONFIG["DEBUG_RESCALE"])),
-                 (0, 140, 255), 2)
-
-        if debug:
-            # Draw ROI and flow vectors
-            scaled_flow = cv2.resize(flow, (dbg_w, dbg_h))
-            dbg_frame = draw_flow_field(dbg_frame,
-                                        scaled_flow,
-                                        step=CONFIG["FLOW_VECTOR_SPACING"],
-                                        scale=1.0,
-                                        color=(255, 0, 0))
-            draw_roi(dbg_frame, (int(car_roi[0] * CONFIG["DEBUG_RESCALE"]),
-                                 int(car_roi[1] * CONFIG["DEBUG_RESCALE"]),
-                                 int(car_roi[2] * CONFIG["DEBUG_RESCALE"]),
-                                 int(car_roi[3] * CONFIG["DEBUG_RESCALE"])),
-                     (0, 255, 0), "Car ROI")
-
-        # Display temporary event labels
-        if label_timer > 0:
-            cv2.putText(dbg_frame, label_text, (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3, cv2.LINE_AA)
-            label_timer -= 1
-
-        writer.write(dbg_frame)
-
-        # Prepare for next frame
+        x, y, w_roi, h_roi = roi
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        roi_mag = np.mean(mag[y:y + h_roi, x:x + w_roi])
+        motion_mags.append(roi_mag)
         prev_gray = gray
         frame_idx += 1
 
-        if progress_bar:
-            progress_bar.progress(min(frame_idx / total, 1.0))
+    motion_mags = np.array(motion_mags)
+    t = np.arange(len(motion_mags)) / fps
+
+    # Detect events using thresholds
+    stop_idx = np.argmax(motion_mags < 0.5)
+    up_idx = np.argmax(motion_mags > 2.0)
+    down_idx = np.argmax((t > t[up_idx]) & (motion_mags < 1.0))
+    depart_idx = np.argmax((t > t[down_idx]) & (motion_mags > 2.0))
+
+    if stop_idx: events["Car Stop Time (s)"] = round(t[stop_idx], 2)
+    if up_idx: events["Car Up Time (s)"] = round(t[up_idx], 2)
+    if down_idx: events["Car Down Time (s)"] = round(t[down_idx], 2)
+    if depart_idx: events["Car Depart Time (s)"] = round(t[depart_idx], 2)
+    if stop_idx and depart_idx:
+        events["Pit Duration (s)"] = round(t[depart_idx] - t[stop_idx], 2)
 
     cap.release()
-    writer.release()
+    return events
+# ============================================================
+# FRONT TIRE CHANGER (FTC) PERFORMANCE ANALYSIS
+# ============================================================
+def analyze_ftc_performance(video_path, car_events, debug=False):
+    """
+    Estimates timing of key Front Tire Changer actions.
+    Uses optical flow magnitude changes within defined ROIs.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    ret, prev = cap.read()
+    if not ret:
+        return {}
 
-    # Collect results
-    results = {
-        "Car Stop Time (s)": round(car_stop or 0, 2),
-        "Car Up Time (s)": round(car_up or 0, 2),
-        "Car Down Time (s)": round(car_down or 0, 2),
-        "Car Depart Time (s)": round(car_depart or 0, 2),
-        "Pit Duration (s)": round((car_depart - car_stop)
-                                  if car_stop and car_depart else 0, 2),
-        "Debug Video": debug_path
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    h, w = prev_gray.shape
+
+    # Define FTC work areas
+    outside_roi = (int(w * 0.65), int(h * 0.55), int(w * 0.3), int(h * 0.35))
+    inside_roi  = (int(w * 0.05), int(h * 0.55), int(w * 0.3), int(h * 0.35))
+
+    mags_out, mags_in, t = [], [], []
+    frame_idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
+                                            0.5, 3, 15, 3, 5, 1.2, 0)
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        x, y, w1, h1 = outside_roi
+        mags_out.append(np.mean(mag[y:y + h1, x:x + w1]))
+        x, y, w2, h2 = inside_roi
+        mags_in.append(np.mean(mag[y:y + h2, x:x + w2]))
+        prev_gray = gray
+        frame_idx += 1
+        t.append(frame_idx / fps)
+    cap.release()
+
+    mags_out, mags_in, t = np.array(mags_out), np.array(mags_in), np.array(t)
+    base_time = car_events.get("Car Stop Time (s)", 0)
+
+    # Action inference
+    stats = {
+        "Time To Tire Drop (s)": None,
+        "Time To Wheel Nut (s)": None,
+        "First Tire Exchange (s)": None,
+        "Crossover Time (s)": None,
+        "Second Tire Exchange (s)": None,
+        "Tire to Car Drop (s)": None
     }
 
-    return results
-# -----------------------------------------------------------
-# FRONT TIRE CHANGER (FTC) TRACKING SYSTEM
-# -----------------------------------------------------------
-def track_ftc(video_path, car_stop_time, fps, w, h, debug=False):
-    """
-    Analyzes Front Tire Changer motion after car stop.
-    Returns timestamps for key crew events relative to car stop.
-    """
+    drop_idx = np.argmax(mags_out > 1.5)
+    if drop_idx:
+        stats["Time To Tire Drop (s)"] = round(t[drop_idx] - base_time, 2)
+    nut_idx = np.argmax(mags_out > 2.5)
+    if nut_idx:
+        stats["Time To Wheel Nut (s)"] = round(t[nut_idx] - base_time, 2)
+    exch1_idx = np.argmax((t > t[nut_idx]) & (mags_out < 1.0))
+    cross_idx = np.argmax(mags_in > 1.5)
+    exch2_idx = np.argmax((t > t[cross_idx]) & (mags_in < 1.0))
+    cardrop_idx = np.argmax(t > car_events.get("Car Down Time (s)", 0))
 
+    if exch1_idx: stats["First Tire Exchange (s)"] = round(t[exch1_idx] - base_time, 2)
+    if cross_idx: stats["Crossover Time (s)"] = round(t[cross_idx] - base_time, 2)
+    if exch2_idx: stats["Second Tire Exchange (s)"] = round(t[exch2_idx] - base_time, 2)
+    if cardrop_idx: stats["Tire to Car Drop (s)"] = round(t[cardrop_idx] - base_time, 2)
+    return stats
+
+
+# ============================================================
+# MAIN VIDEO ANALYSIS PIPELINE
+# ============================================================
+def analyze_video(video_path, progress_bar, debug=False, calibration=False):
+    """
+    Runs full analysis (Car events + FTC metrics) and produces annotated MP4.
+    """
+    car_events = analyze_car_events(video_path, debug)
+    ftc_stats = analyze_ftc_performance(video_path, car_events, debug)
+
+    # Prepare annotated video
     cap = cv2.VideoCapture(video_path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    flow_scale = CONFIG["FLOW_RESCALE"]
-    small_w, small_h = int(w * flow_scale), int(h * flow_scale)
-
-    # Define ROIs relative to car position
-    outside_roi = (int(w * 0.65), int(h * 0.5), int(w * 0.3), int(h * 0.4))
-    inside_roi = (int(w * 0.05), int(h * 0.5), int(w * 0.3), int(h * 0.4))
-    crossover_roi = (int(w * 0.35), int(h * 0.45), int(w * 0.3), int(h * 0.25))
-
-    # Read first frame
-    ret, first = cap.read()
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = f"/tmp/annotated_{timestamp}.mp4"
+    out = cv2.VideoWriter(output_path,
+                          cv2.VideoWriter_fourcc(*'mp4v'),
+                          fps, (w, h))
+    frame_idx, total = 0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ret, prev_frame = cap.read()
     if not ret:
-        return {k: None for k in [
-            "Tire Drop", "Wheel Nut", "Tire Exchange 1",
-            "Crossover", "Tire Exchange 2", "Car Drop"
-        ]}
+        return {}
 
-    prev_gray = cv2.cvtColor(cv2.resize(first, (small_w, small_h)), cv2.COLOR_BGR2GRAY)
-
-    # FTC event times
-    ftc_events = {k: None for k in [
-        "Tire Drop", "Wheel Nut", "Tire Exchange 1",
-        "Crossover", "Tire Exchange 2", "Car Drop"
-    ]}
-    event_triggered = set()
-
-    frame_idx = 0
-    flow_energy_out, flow_energy_in, flow_energy_cross = [], [], []
-    last_active_zone = None
-
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        frame_small = cv2.resize(frame, (small_w, small_h))
-        gray = cv2.cvtColor(frame_small, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
-        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-        # Calculate flow magnitude for each ROI
-        def roi_energy(roi):
-            x, y, w_, h_ = [int(i * flow_scale) for i in roi]
-            return np.mean(mag[y:y + h_, x:x + w_])
-
-        e_out = roi_energy(outside_roi)
-        e_in = roi_energy(inside_roi)
-        e_cross = roi_energy(crossover_roi)
-
-        flow_energy_out.append(e_out)
-        flow_energy_in.append(e_in)
-        flow_energy_cross.append(e_cross)
-
-        # Keep last ~2s of data
-        max_len = int(fps * 2)
-        if len(flow_energy_out) > max_len:
-            flow_energy_out.pop(0)
-            flow_energy_in.pop(0)
-            flow_energy_cross.pop(0)
-
-        t_sec = frame_idx / fps
-
-        # ---------------------------------------------------
-        # EVENT DETECTION LOGIC
-        # ---------------------------------------------------
-        # 1. Tire Drop — first strong motion in outside ROI
-        if ftc_events["Tire Drop"] is None and e_out > CONFIG["FTC_ACTIVITY_THRESHOLD"]:
-            ftc_events["Tire Drop"] = round(t_sec - car_stop_time, 2)
-            last_active_zone = "outside"
-
-        # 2. Wheel Nut — burst of energy soon after Tire Drop
-        if ftc_events["Tire Drop"] and ftc_events["Wheel Nut"] is None and e_out > CONFIG["FTC_ACTIVITY_THRESHOLD"] * 1.3:
-            ftc_events["Wheel Nut"] = round(t_sec - car_stop_time, 2)
-            last_active_zone = "outside"
-
-        # 3. Tire Exchange 1 — drop in flow after sustained activity
-        if ftc_events["Wheel Nut"] and ftc_events["Tire Exchange 1"] is None:
-            recent_avg = np.mean(flow_energy_out[-int(fps * 0.5):])
-            if recent_avg < CONFIG["FTC_ACTIVITY_THRESHOLD"] * 0.7:
-                ftc_events["Tire Exchange 1"] = round(t_sec - car_stop_time, 2)
-                last_active_zone = "outside"
-
-        # 4. Crossover — motion in crossover ROI
-        if ftc_events["Tire Exchange 1"] and ftc_events["Crossover"] is None and e_cross > CONFIG["FTC_ACTIVITY_THRESHOLD"]:
-            ftc_events["Crossover"] = round(t_sec - car_stop_time, 2)
-            last_active_zone = "crossover"
-
-        # 5. Tire Exchange 2 — activity in inside ROI
-        if ftc_events["Crossover"] and ftc_events["Tire Exchange 2"] is None and e_in > CONFIG["FTC_ACTIVITY_THRESHOLD"]:
-            ftc_events["Tire Exchange 2"] = round(t_sec - car_stop_time, 2)
-            last_active_zone = "inside"
-
-        # 6. Car Drop — final burst (air wand pull / car down)
-        if ftc_events["Tire Exchange 2"] and ftc_events["Car Drop"] is None and e_in > CONFIG["FTC_ACTIVITY_THRESHOLD"] * 1.2:
-            ftc_events["Car Drop"] = round(t_sec - car_stop_time, 2)
-            last_active_zone = "inside"
-
-        # ---------------------------------------------------
-        # DEBUG VISUALIZATION
-        # ---------------------------------------------------
         if debug:
-            overlay = frame.copy()
-            draw_roi(overlay, outside_roi, (255, 255, 0), "Outside")
-            draw_roi(overlay, crossover_roi, (0, 165, 255), "Crossover")
-            draw_roi(overlay, inside_roi, (255, 255, 0), "Inside")
+            frame = draw_flow_field(frame, flow, step=16, scale=6)
 
-            active_color = (0, 255, 255)
-            if last_active_zone == "outside":
-                draw_roi(overlay, outside_roi, active_color)
-            elif last_active_zone == "crossover":
-                draw_roi(overlay, crossover_roi, active_color)
-            elif last_active_zone == "inside":
-                draw_roi(overlay, inside_roi, active_color)
-
+        # Annotate car event markers
+        now_t = frame_idx / fps
+        for k, v in car_events.items():
+            if v is not None and abs(now_t - v) < 0.3:
+                cv2.putText(frame, k.replace("(s)", ""), (30, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
         prev_gray = gray
+        out.write(frame)
         frame_idx += 1
-
+        if frame_idx % 10 == 0:
+            progress_bar.progress(frame_idx / total)
     cap.release()
-    return ftc_events
+    out.release()
+    progress_bar.progress(1.0)
+    return {"Car Events": car_events, "FTC Stats": ftc_stats, "Annotated Video": output_path}
 
 
-# -----------------------------------------------------------
-# STREAMLIT USER INTERFACE + COMBINED ANALYSIS LOGIC
-# -----------------------------------------------------------
-st.set_page_config(page_title="VSR Pit Stop Analyzer v12.8", layout="wide")
-st.title("🏁 VSR Pit Stop Analyzer v12.8 (Precision + Crew Edition)")
+# ============================================================
+# STREAMLIT INTERFACE
+# ============================================================
+st.title("🏁 VSR Pit Stop Analyzer v12.9 (Precision + Crew Edition)")
+st.markdown("---")
 
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Settings")
-    upl = st.file_uploader("🎥 Upload Pit Stop Video", type=["mp4", "mov", "avi"])
-    debug_mode = st.checkbox("🔍 Enable Debug Mode", value=False)
-    calib_mode = st.checkbox("📏 Calibration Preview", value=False)
-    start_btn = st.button("▶️ Start Analysis")
-    progress_bar = st.progress(0.0)
+debug_mode = st.sidebar.checkbox("🔍 Enable Debug Mode", value=False)
+calib_mode = st.sidebar.checkbox("🧭 Calibration Preview", value=False)
 
-# -----------------------------------------------------------
-# CALIBRATION PREVIEW HANDLER
-# -----------------------------------------------------------
-if calib_mode and upl:
-    st.subheader("Calibration Preview")
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tfile.write(upl.read())
-    cap = cv2.VideoCapture(tfile.name)
-    ret, frame = cap.read()
-    cap.release()
-    if ret:
-        preview = calibration_preview(frame)
-        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
-                 caption="Verify ROI Alignment and Pit Line Position",
-                 use_container_width=True)
-    else:
-        st.warning("⚠️ Unable to load first frame for calibration preview.")
+uploaded_file = st.sidebar.file_uploader("🎥 Upload Pit Stop Video",
+                                         type=["mp4", "mov", "avi", "mpeg4"])
 
-# -----------------------------------------------------------
-# MAIN ANALYSIS PIPELINE TRIGGER
-# -----------------------------------------------------------
-if start_btn and upl:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(upl.read())
-        tmp_path = tmp.name
+if uploaded_file:
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp_file.write(uploaded_file.read())
+    tmp_file.close()
 
-    st.info("⏳ Analyzing video — please wait while optical flow is processed…")
+    st.video(tmp_file.name)
+    if st.button("▶️ Start Analysis"):
+        progress_bar = st.progress(0)
+        if calib_mode:
+            cap = cv2.VideoCapture(tmp_file.name)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                st.image(cv2.cvtColor(calibration_preview(frame), cv2.COLOR_BGR2RGB),
+                         caption="Calibration Overlay", use_container_width=True)
 
-    # Step 1 — Run car event detection
-    car_results = analyze_video(tmp_path, upl.name, progress_bar, debug_mode)
-    if not car_results:
-        st.error("❌ Video analysis failed.")
-        st.stop()
+        st.info("⏱️ Analyzing video — please wait while optical flow is processed...")
+        result = analyze_video(tmp_file.name, progress_bar, debug_mode, calib_mode)
 
-    # Step 2 — Run FTC tracking based on car stop time
-    cap = cv2.VideoCapture(tmp_path)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    cap.release()
+        st.success("✅ Analysis Complete!")
+        st.markdown("### Car Event Summary")
+        st.json(result["Car Events"])
 
-    ftc_results = track_ftc(tmp_path, car_results["Car Stop Time (s)"], fps, w, h, debug_mode)
-    car_results.update({f"FTC {k} (s)": v for k, v in ftc_results.items()})
+        st.markdown("### Front Tire Changer Performance")
+        st.json(result["FTC Stats"])
 
-    st.success("✅ Analysis Complete!")
-
-    # -------------------------------------------------------
-    # RESULTS DISPLAY
-    # -------------------------------------------------------
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("🚗 Car Events")
-        for key in ["Car Stop Time (s)", "Car Up Time (s)",
-                    "Car Down Time (s)", "Car Depart Time (s)",
-                    "Pit Duration (s)"]:
-            st.metric(key.replace(" (s)", ""), f"{car_results[key]} s")
-
-    with col2:
-        st.subheader("👨‍🔧 Front Tire Changer Performance")
-        for k, v in ftc_results.items():
-            label = k.replace("FTC ", "")
-            st.metric(label, f"{v} s" if v else "—")
-
-    # -------------------------------------------------------
-    # VIDEO OUTPUT
-    # -------------------------------------------------------
-    st.subheader("🎬 Debug / Annotated Video")
-    st.video(car_results["Debug Video"])
-    with open(car_results["Debug Video"], "rb") as f:
-        st.download_button("⬇️ Download Debug MP4",
-                           data=f,
-                           file_name=os.path.basename(car_results["Debug Video"]),
-                           mime="video/mp4")
-
-    st.caption("Tip: In Debug Mode you will see optical flow vectors, ROIs, and event labels in real time.")
-# -----------------------------------------------------------
-# FINALIZATION + CLEANUP UTILITIES
-# -----------------------------------------------------------
-def cleanup_temp_files():
-    """Remove old temporary debug videos to free storage."""
-    temp_dir = tempfile.gettempdir()
-    for f in os.listdir(temp_dir):
-        if f.endswith("_debug.mp4"):
-            try:
-                os.remove(os.path.join(temp_dir, f))
-            except Exception:
-                pass
-
-def display_summary(car_results, ftc_results):
-    """Prints a summary table in plain text for logs or console runs."""
-    st.markdown("---")
-    st.subheader("📋 Pit Stop Summary (Text Output)")
-    summary = []
-    for k in ["Car Stop Time (s)", "Car Up Time (s)", "Car Down Time (s)", "Car Depart Time (s)", "Pit Duration (s)"]:
-        summary.append(f"{k}: {car_results.get(k, '—')}")
-    for k, v in ftc_results.items():
-        summary.append(f"FTC {k}: {v if v else '—'}")
-    st.text("\n".join(summary))
-
-# -----------------------------------------------------------
-# ENTRY POINT HANDLER (FOR LOCAL DEV OR STREAMLIT CLOUD)
-# -----------------------------------------------------------
-if __name__ == "__main__":
-    st.markdown("""
-    <div style='background-color:#111;padding:15px;border-radius:10px;'>
-        <h3 style='color:#00FFAA;'>🏁 VSR Pit Stop Analyzer v12.8 Initialized</h3>
-        <p style='color:#CCCCCC;'>Ready for analysis. Upload an overhead pit stop video to begin.</p>
-        <ul style='color:#AAAAAA;'>
-            <li>Car detection uses optical flow with sustained motion filters.</li>
-            <li>Front Tire Changer (FTC) stats calculated relative to Car Stop.</li>
-            <li>Use <b>Debug Mode</b> to visualize flow vectors and ROIs.</li>
-            <li>Use <b>Calibration Preview</b> to verify ROI scaling on new cameras.</li>
-        </ul>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.caption("Developed for precision IMSA-style pit stop analysis. Streamlit-ready.")
-    cleanup_temp_files()
+        st.markdown("### 🎬 Annotated Debug Video")
+        st.video(result["Annotated Video"])
