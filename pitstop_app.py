@@ -286,7 +286,7 @@ if uploaded_file:
             cap.release()
             if ret:
                 st.image(cv2.cvtColor(calibration_preview(frame), cv2.COLOR_BGR2RGB),
-                         caption="Calibration Overlay", use_container_width=True)
+                         caption="Calibration Overlay")
 
         st.info("⏱️ Analyzing video — please wait while optical flow is processed...")
         result = analyze_video(tmp_file.name, progress_bar, debug_mode, calib_mode)
